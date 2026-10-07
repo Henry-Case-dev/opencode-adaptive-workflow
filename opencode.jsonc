@@ -1,0 +1,159 @@
+{
+  "$schema": "https://opencode.ai/config.json",
+  "default_agent": "Orchestrator",
+  "permissions": [
+    {
+      "action": "execute",
+      "resource": "*",
+      "effect": "allow"
+    },
+    {
+      "action": "context7_*",
+      "resource": "*",
+      "effect": "allow"
+    },
+    {
+      "action": "exa_*",
+      "resource": "*",
+      "effect": "allow"
+    },
+    {
+      "action": "duckduckgo_*",
+      "resource": "*",
+      "effect": "allow"
+    },
+    {
+      "action": "filesystem_*",
+      "resource": "*",
+      "effect": "allow"
+    },
+    {
+      "action": "sequential-thinking_*",
+      "resource": "*",
+      "effect": "allow"
+    },
+    {
+      "action": "playwright_*",
+      "resource": "*",
+      "effect": "deny"
+    },
+    {
+      "action": "browseruse_*",
+      "resource": "*",
+      "effect": "deny"
+    },
+    {
+      "action": "memory_*",
+      "resource": "*",
+      "effect": "deny"
+    }
+  ],
+  "mcp": {
+    "timeout": {
+      "startup": 60000,
+      "catalog": 30000,
+      "execution": 600000
+    },
+    "servers": {
+      "playwright": {
+        "type": "local",
+        "command": [
+          "cmd",
+          "/c",
+          "npx",
+          "-y",
+          "@playwright/mcp",
+          "--browser",
+          "chrome",
+          "--file-paths=absolute"
+        ],
+        "disabled": false,
+        "codemode": true
+      },
+      "browseruse": {
+        "type": "local",
+        "command": [
+          "uvx",
+          "--from",
+          "browser-use[cli]",
+          "browser-use",
+          "--cli-mcp"
+        ],
+        "disabled": false,
+        "codemode": true
+      },
+      "context7": {
+        "type": "remote",
+        "url": "https://mcp.context7.com/mcp",
+        "oauth": false,
+        "headers": {
+          "CONTEXT7_API_KEY": "ВСТАВЬ СВОЙ КЛЮЧ СЮДА"
+        },
+        "disabled": false,
+        "codemode": true
+      },
+      "exa": {
+        "type": "remote",
+        "url": "https://mcp.exa.ai/mcp",
+        "oauth": false,
+        "headers": {
+          "x-api-key": "ВСТАВЬ СВОЙ КЛЮЧ СЮДА"
+        },
+        "disabled": false,
+        "codemode": true
+      },
+      "duckduckgo": {
+        "type": "local",
+        "command": [
+          "cmd",
+          "/c",
+          "npx",
+          "-y",
+          "duckduckgo-mcp-server"
+        ],
+        "disabled": false,
+        "codemode": true
+      },
+      "filesystem": {
+        "type": "local",
+        "command": [
+          "cmd",
+          "/c",
+          "npx",
+          "-y",
+          "@modelcontextprotocol/server-filesystem",
+          "."
+        ],
+        "disabled": false,
+        "codemode": true
+      },
+      "memory": {
+        "type": "local",
+        "command": [
+          "cmd",
+          "/c",
+          "npx",
+          "-y",
+          "@modelcontextprotocol/server-memory"
+        ],
+        "environment": {
+          "MEMORY_FILE_PATH": "~/.config/opencode/memory.jsonl"
+        },
+        "disabled": false,
+        "codemode": true
+      },
+      "sequential-thinking": {
+        "type": "local",
+        "command": [
+          "cmd",
+          "/c",
+          "npx",
+          "-y",
+          "@modelcontextprotocol/server-sequential-thinking"
+        ],
+        "disabled": false,
+        "codemode": true
+      }
+    }
+  }
+}
