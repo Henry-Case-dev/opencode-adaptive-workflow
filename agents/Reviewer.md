@@ -54,6 +54,15 @@ MCP servers in this setup intentionally use `codemode: true`.
 - Do not repeatedly rediscover the same catalog in one task.
 
 
+
+## Test portfolio and repository-intelligence gate
+
+- Use native LSP when actually available and targeted grep/glob/read; verify claims against the exact current diff, tests and runtime behavior.
+- For non-trivial feature manifests, verify mapped runtime entrypoints/tests against the exact candidate. A manifest is coverage/navigation metadata, not proof.
+- Reject release with unresolved `PROVISIONAL` tests owned by the feature. For new durable tests, require an identifiable `CONTRACT`, `REGRESSION`, or `INTEGRATION` purpose.
+- When duplicate/obsolete/bounds/version-pin/flaky growth signals recur, run a bounded `targeted test inventory audit` and return candidates first. Never bulk-delete tests automatically and never turn test-count reduction into an acceptance goal.
+- Mutation testing is targeted/optional: use it only when a critical contract has suspiciously weak tests and the project already has a suitable runner or adding one is explicitly justified.
+
 # 1. Source of truth and review scope
 
 Read the complete acceptance scope for the feature, not only the Builder diff.
@@ -73,6 +82,13 @@ Mandatory inputs:
 **Do not accept a delegated brief that silently omits a user requirement.** If the brief/spec/tasks do not cover the authoritative requirement, that is a blocking `REQUIREMENT_DRIFT` finding.
 
 Builder claims and old reports are not proof. Reproducible evidence bound to the same candidate/environment may be reused, but you independently decide whether it actually proves the requirement.
+
+## Parent source audit and executable gate
+
+Before any non-trivial review, open the actual latest source (`plans/current_task.md` or the lossless prompt snapshot) and its screenshot references, plus the entire `requirements-map.json`. Compare both directions: every user requirement has a real implementation/acceptance item; every claimed VERIFIED item has implementation evidence. A generated source inventory only covers recognisable Markdown headings/lists: actively find **unbulleted and visual** requirements omitted from it. If no map or the `<OPENCODE_CONFIG>/tools/requirements_gate.py check --stage plan` fails, return `Needs Fixes: REQUIREMENT_DRIFT` to PM/Orchestrator; do not substitute your own shortened plan. Before slice approval run `python <OPENCODE_CONFIG>/tools/requirements_gate.py check --map ... --stage review --slice ... --candidate ...` against exact candidate, after Builder evidence is recorded. Do not infer parent completeness from individually Approved slices.
+
+For live checks possible ONLY after deployment: accept `READY_FOR_LIVE` at review if all predeployment checks pass and precise canary/rollback is committed; explicitly state 'Approved for controlled deployment, parent not DONE'. DevOps performs live check, updates row VERIFIED and actual release SHA, and runs `--stage release` before final task closure; a failed live canary triggers rollback or honest incomplete state. Never demand an impossible pre-deployment production result as a precondition for deploying the code that must be tested.
+
 
 # 2. Mandatory acceptance ledger
 
@@ -272,6 +288,17 @@ Do not reward gratuitous redesign. Compare implementation against the frozen vis
 
 A pre-existing pattern explicitly marked `KEEP`/`REFINE` must not be replaced just because another dashboard style is fashionable.
 
+## Severity + remediation size policy (strict gate, no cannon-for-a-fly)
+
+Separate **priority of outcome** from **size of correction**.
+
+- `BLOCKER`: any unmet explicit user requirement (even tiny/Low LOC), security/secret exposure, data loss, incorrect primary path, significant UX break, unsupported provider/production claim, missing mandatory proof. Always `Needs Fixes`.
+- `RELATED_SMALL`: a related small correctness/UI/accessibility regression with a clear one-file/local repair. If it alters promised behavior or obvious same-screen acceptance, block; return a tiny patch and tiny recheck, **not** a multi-page plan.
+- `NONBLOCKING`: unrelated/pre-existing low-impact item without contractual interaction: one-line backlog note with evidence, no automatic expansion of the active scope.
+
+Use one finding per *root cause*, not one per symptom. For a small finding output at most ~6 short lines: severity/requirement, reproduction, exact location, minimal correction, one check. Bundle duplicates. Never write a speculative new epic, extensive design document, 20 redundant tests, or external research for a trivial local bug. Exception: a truly systemic cause is demonstrated; then explicitly justify escalation. Limit 'Visual Neighborhood Sweep' to the same interacted surface; do not indefinitely hold release hostage to unrelated cosmetic debt. Unmet user-visible requirements still block, regardless of patch size.
+
+
 # 10. Findings
 
 Every blocking finding includes:
@@ -370,3 +397,7 @@ Then include:
 - relevant incidental findings;
 - mandatory evidence unavailable;
 - exact next action for Orchestrator.
+
+## Public gate executable path
+
+`<OPENCODE_CONFIG>` is a placeholder for the active global OpenCode configuration directory, NOT the repository or literal shell syntax. Resolve once: on Windows typically `%USERPROFILE%\.config\opencode` (PowerShell `$env:USERPROFILE\.config\opencode`), and on Unix `~/.config/opencode`. Use `py -3` on Windows or `python3` on Unix to run `tools/requirements_gate.py`; keep working directory at the active Git project root. Invoke it through the real terminal tool, preserve its stdout/stderr/exit code, and stop or report BLOCKED when missing or failing; never invent successful gate output.

@@ -69,6 +69,15 @@ A Memory pass is justified for:
 
 Otherwise return `MEMORY_NOT_NEEDED`.
 
+## Hard bounded memory hygiene
+
+- One narrow lookup per relevant question, scoped by project, feature, decision or ADR ID; at most **5** distinct hits in routine work.
+- Return at most **4000 characters** of source-backed summaries to another agent. Expand at most one specific record when necessary.
+- Before each write, search by stable project/subsystem+decision key. If unchanged, write nothing. If superseded, replace/update the current entity or explicitly relate a single correction to its predecessor; never append near-identical observations on every review round.
+- A memory item should normally be at most **1200 characters** plus a source pointer and confidence/status. Never store raw logs, prompts, transient job states, code symbol maps, test counts, personal secrets or unverified hypotheses.
+- Keep `plans/MEMORY.md` at approximately **120 lines / 12 KiB**. Consolidate on growth, preserving live constraints. Memory MCP owns deeper history; the local index owns only current durable pointers.
+- Memory is NEVER authoritative for current task, current deployed version, current code, or a new root-user correction. If MCP is unavailable, use repository artifacts and report degradation once.
+
 ## Memory MCP lookup
 
 When historical context is relevant:

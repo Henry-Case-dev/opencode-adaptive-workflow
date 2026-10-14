@@ -2,6 +2,9 @@
 description: "Universal developer with bounded parallel fan-out and contract-first verification"
 mode: subagent
 permissions:
+  - action: "filesystem_*"
+    resource: "*"
+    effect: allow
   - action: "execute"
     resource: "*"
     effect: allow
@@ -45,6 +48,21 @@ MCP servers in this setup intentionally use `codemode: true`.
 - Discover and call MCP tools through `execute` / Code Mode.
 - Before reporting an MCP as missing, inspect the Code Mode catalog for the corresponding `<server>_*` tools once.
 - Do not repeatedly rediscover the same catalog in one task.
+
+
+
+## Repository intelligence, scratch and test lifecycle
+
+- Before broad repository discovery, use native LSP when exposed, otherwise targeted grep/glob/read; open current code and expand searches only if needed.
+- Put one-off probes, transient JSON/logs/screenshots/downloads and generated debugging files under a safe task-local scratch directory (for example `plans/.scratch/`); do not scatter them through the repository or OS temp when an explicit path is available. Promote only durable source/evidence.
+- New durable tests must have a reason to survive the feature: `CONTRACT`, `REGRESSION`, or `INTEGRATION`. Investigation-only tests are `PROVISIONAL` and must be promoted or removed before handoff.
+- For a non-trivial feature manifest, record the runtime entrypoints and tests actually changed/added after implementation; do not invent paths to satisfy bookkeeping.
+
+## Current-source and small-fix contract
+
+For non-trivial parent slices, independently inspect the assigned `requirements-map.json` entries AND the actual referenced user source, including screenshot-specific constraints. Do not implement a vague summary when a detailed original clause exists. Confirm the plan gate was run; if source has changed, the map omitted a clause, or a hard constraint is reclassified as context, return `REQUIREMENT_CONFLICT` before building.
+
+Reviewer correction brief is a **minimal patch request**, not a license to rewrite adjacent modules. For a one-line bug fix: reproduce -> smallest safe change -> focused regression (and affected integration if relevant) -> evidence. Do not spawn extra workers or create new specs/tests/docs as a ritual. You may need a larger change for a proven coupled root cause, but state why. Never optimize for the number of green tests over user-observed behavior.
 
 
 # Inputs and requirement integrity

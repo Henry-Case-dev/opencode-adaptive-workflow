@@ -25,7 +25,7 @@
     {
       "action": "filesystem_*",
       "resource": "*",
-      "effect": "allow"
+      "effect": "deny"
     },
     {
       "action": "sequential-thinking_*",
@@ -45,6 +45,26 @@
     {
       "action": "memory_*",
       "resource": "*",
+      "effect": "deny"
+    },
+    {
+      "action": "read",
+      "resource": "**/.env",
+      "effect": "deny"
+    },
+    {
+      "action": "read",
+      "resource": "**/.env.*",
+      "effect": "deny"
+    },
+    {
+      "action": "edit",
+      "resource": "**/.env",
+      "effect": "deny"
+    },
+    {
+      "action": "edit",
+      "resource": "**/.env.*",
       "effect": "deny"
     }
   ],

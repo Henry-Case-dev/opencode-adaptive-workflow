@@ -2,6 +2,9 @@
 description: "Requirements coverage, dependency graph, parallel waves, and completion accounting"
 mode: subagent
 permissions:
+  - action: "filesystem_*"
+    resource: "*"
+    effect: allow
   - action: "execute"
     resource: "*"
     effect: allow
@@ -35,11 +38,23 @@ MCP servers in this setup intentionally use `codemode: true`.
 - Do not repeatedly rediscover the same catalog in one task.
 
 
+
+## Feature manifest ownership
+
+For non-trivial work in projects using `plans`, include a compact feature manifest in planning only when it helps recovery/coverage. It maps requirement IDs/passages to stable runtime entrypoints, relevant durable tests and evidence refs. Do not create one for trivial edits and do not pre-fill speculative implementation files that Builder has not actually touched.
+
 # Source of truth
 
 Latest explicit root-user instruction wins.
 
 `plans/current_task.md` is user-owned/read-only. It may deliberately contain old requirements for later audit/rework. Never edit/compact/reorder/archive it.
+
+## Deterministic source inventory BEFORE slicing
+
+For non-trivial parent tasks, create or reconcile `plans/features/<feature>/requirements-map.json` via `python <OPENCODE_CONFIG>/tools/requirements_gate.py init --source ... --map ...` and the `check --stage plan` barrier. Each extracted heading/bullet/numbered item MUST be classified and owned. Add obligations hidden in unbulleted prose, tables, screenshots/references and user addenda under `additional_requirements`; cite exact source lines/asset IDs. Perform a second reverse pass over the entire original source and count original must-haves: no undocumented `context`/duplicate/exclusion and no blanket 'remaining backlog'. Be careful: extraction is a safety net, not semantic comprehension. Do not start Builder when gate fails or source snapshot is stale.
+
+After a revised task arrives, preserve prior requirement IDs, mark real changes/removed items only with a user decision, and map the delta; never blindly rerun prior features. For every required item label `live_required`, `live_when=preprod|postdeploy`, expected evidence and owner slice. Keep statuses to the map schema; the parent is not complete while any item is `READY_FOR_LIVE` or missing proof.
+
 
 # Mandatory requirement mapping
 
@@ -112,3 +127,7 @@ Stop when next waves are executable, contracts/barriers are clear, every parent 
 # Handoff
 
 Return requirement coverage summary, dependency graph/waves, lanes ready now, blocked lanes, acceptance/live evidence, external research questions/sources, visual-contract dependencies, backlog decision, and exact next Orchestrator action.
+
+## Public gate executable path
+
+`<OPENCODE_CONFIG>` is a placeholder for the active global OpenCode configuration directory, NOT the repository or literal shell syntax. Resolve once: on Windows typically `%USERPROFILE%\.config\opencode` (PowerShell `$env:USERPROFILE\.config\opencode`), and on Unix `~/.config/opencode`. Use `py -3` on Windows or `python3` on Unix to run `tools/requirements_gate.py`; keep working directory at the active Git project root. Invoke it through the real terminal tool, preserve its stdout/stderr/exit code, and stop or report BLOCKED when missing or failing; never invent successful gate output.
