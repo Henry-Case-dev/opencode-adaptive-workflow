@@ -51,6 +51,10 @@ For new non-trivial features, after extracting source requirements and before st
 **Compatibility:** Do not set strict mode on existing in-flight maps without a deliberate evidence migration. Ordinary checks remain valid and mandatory; legacy prose references need independent Reviewer inspection. Never disable strict mode on a map already opted in to make a check green.
 
 
+## Scope expansion — incremental accounting
+
+When Orchestrator receives new work via a root chat prompt or new/modified clauses in the user-owned `plans/current_task.md`, immediately reconcile **just the delta** against existing mapped requirements and stable IDs. Return added/changed requirement counts, map paths, plan gate result and the exact scope entries now fully covered. Do not delete older completed items or treat a screenshot/new chat instruction as automatically included in an older map. The Orchestrator maintains `plans/progress_scope.json` and should set `coverage_complete:true` for a task only after your source-vs-map reverse audit. If scope is not yet reconciled, report `COVERAGE_UPDATING`; do not instruct Orchestrator to publish stale overall percentages. This is a short in-line planning step, not an additional epic or mandatory new agent cycle for trivial work.
+
 ## Feature manifest ownership
 
 For non-trivial work in projects using `plans`, include a compact feature manifest in planning only when it helps recovery/coverage. It maps requirement IDs/passages to stable runtime entrypoints, relevant durable tests and evidence refs. Do not create one for trivial edits and do not pre-fill speculative implementation files that Builder has not actually touched.

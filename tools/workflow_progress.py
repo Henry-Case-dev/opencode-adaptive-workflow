@@ -9,6 +9,7 @@ Run from the project repository root; maps are project files, this script is glo
 from __future__ import annotations
 
 import argparse
+import hashlib
 from collections import Counter, defaultdict
 from datetime import datetime
 import json
@@ -17,10 +18,12 @@ import re
 import sys
 
 SCHEMA = "openworkflow-coverage-v1"
+SCOPE_SCHEMA = "openworkflow-progress-scope-v1"
+TASK_STATES = {"PENDING", "BUILDING", "REVIEW", "READY_FOR_LIVE", "WAITING_EXTERNAL", "BLOCKED_REAL_HUMAN_GATE", "FAILED", "VERIFIED"}
 KNOWN_STATES = {"PENDING", "BUILDING", "REVIEW", "VERIFIED", "FAILED", "BLOCKED_REAL_HUMAN_GATE", "READY_FOR_LIVE"}
 
 
-def _load_maps(paths: list[str]) -> dict:
+def _load_maps(paths: list[str], namespaces: dict[Path, str] | None = None) -> dict:
     statuses: dict[tuple[str, str], str] = {}
     owners: dict[str, set[tuple[str, str]]] = defaultdict(set)
     duplicates = 0
@@ -64,7 +67,8 @@ def _load_maps(paths: list[str]) -> dict:
                     raise ValueError(f"у одного требования два статуса: {rid} в {p}")
             else:
                 statuses[key] = state
-            owners[owner].add(key)
+            owner_key = (namespaces.get(p, "legacy") if namespaces else "legacy", owner)
+            owners[owner_key].add(key)
     if not statuses:
         raise ValueError("нет обязательных требований в выбранных картах")
     stat_counts = Counter(statuses.values())
@@ -78,6 +82,98 @@ def _load_maps(paths: list[str]) -> dict:
         "unverified": len(statuses) - completed_req,
         "duplicates_collapsed": duplicates,
     }
+
+
+
+def _load_scope(scope_path: str, label: str) -> dict:
+    """Explicit inventory of ALL in-scope owner requests, not just requirements maps.
+
+    File paths are relative to the project cwd or absolute. The owner-created
+    current_task.md remains read-only; root-input tasks require durable snapshots.
+    A changed source checksum invalidates the previous percentage until reconciliation.
+    """
+    path = Path(scope_path).resolve()
+    if not path.is_file():
+        raise ValueError(f"нет реестра задач: {path}")
+    try:
+        root = json.loads(path.read_text(encoding="utf-8-sig"))
+    except (OSError, UnicodeError, json.JSONDecodeError) as exc:
+        raise ValueError(f"реестр не читается: {path}: {exc}") from exc
+    if root.get("schema") != SCOPE_SCHEMA or not isinstance(root.get("tasks"), list):
+        raise ValueError("неподдерживаемый формат реестра задач")
+    tasks = root["tasks"]
+    if not tasks:
+        raise ValueError("реестр задач пуст; проценты не подтверждены")
+    task_ids, map_paths, uncovered, stale = set(), [], [], []
+    completed_with_maps: list[tuple[str, list[str]]] = []
+    map_namespaces: dict[Path, str] = {}
+    status_count = Counter()
+    for row in tasks:
+        if not isinstance(row, dict):
+            raise ValueError("запись задачи должна быть объектом")
+        tid = str(row.get("id") or "").strip()
+        if not tid or tid in task_ids:
+            raise ValueError(f"пустой или повторный ID задачи: {tid!r}")
+        task_ids.add(tid)
+        status = str(row.get("status") or "").strip().upper()
+        if status not in TASK_STATES:
+            raise ValueError(f"неверный статус задачи {tid}: {status}")
+        status_count[status] += 1
+        sp, fingerprint = row.get("source_path"), row.get("source_sha256")
+        if not isinstance(sp, str) or not sp.strip() or not isinstance(fingerprint, str) or not re.fullmatch(r"[0-9a-fA-F]{64}", fingerprint):
+            stale.append(f"{tid}: нет проверяемого снимка исходного задания")
+        else:
+            source = Path(sp).resolve()
+            if not source.is_file():
+                stale.append(f"{tid}: исходный файл не найден ({sp})")
+            elif hashlib.sha256(source.read_bytes()).hexdigest().lower() != fingerprint.lower():
+                stale.append(f"{tid}: исходное задание изменилось после последнего учёта")
+        mp = row.get("maps", [])
+        if not isinstance(mp, list) or not all(isinstance(x, str) and x.strip() for x in mp):
+            raise ValueError(f"неверный список карт для задачи {tid}")
+        # New tasks count immediately; requirements count only after PM maps them.
+        if not row.get("coverage_complete") or not mp:
+            uncovered.append(tid)
+        if status == "VERIFIED" and mp:
+            completed_with_maps.append((tid, mp))
+        for raw_map in mp:
+            resolved = Path(raw_map).resolve()
+            if resolved in map_namespaces and map_namespaces[resolved] != tid:
+                raise ValueError(f"одна карта привязана к двум разным поручениям: {raw_map}")
+            map_namespaces[resolved] = tid
+            map_paths.append(raw_map)
+    for tid, mapped_paths in completed_with_maps:
+        if tid in uncovered:
+            stale.append(f"{tid}: задача помечена VERIFIED без завершённого учёта требований")
+            continue
+        try:
+            evidence = _load_maps(mapped_paths)
+            if evidence["requirements"]["done"] != evidence["requirements"]["total"]:
+                stale.append(f"{tid}: задача VERIFIED, но в карте остались неподтверждённые требования")
+        except ValueError as exc:
+            stale.append(f"{tid}: ошибочная карта завершённой задачи: {exc}")
+    # Always distinguish total owner requests from requirements/slices.
+    snap = {
+        "at_local": _clock(), "scope": label, "scope_file": str(path),
+        "tasks": {"done": status_count["VERIFIED"], "total": len(tasks)},
+        "task_statuses": dict(sorted(status_count.items())),
+        "unmapped_tasks": uncovered, "stale_sources": stale,
+        "measurable": not stale,
+    }
+    if stale:
+        snap["reason"] = "область задач или их подтверждения устарели; сначала сверить исходники, карты и статусы"
+        return snap
+    if map_paths:
+        snap.update(_load_maps(map_paths, namespaces=map_namespaces))
+    if uncovered:
+        snap["requirements_measurable"] = False
+        snap["requirements_reason"] = f"{len(uncovered)} задач ещё не перенесены полностью в карты требований"
+    elif not map_paths:
+        snap["requirements_measurable"] = False
+        snap["requirements_reason"] = "нет карт требований"
+    else:
+        snap["requirements_measurable"] = True
+    return snap
 
 
 def _clock() -> str:
@@ -94,7 +190,9 @@ def _stat(done: int, total: int, width: int = 20) -> str:
     return f"{done}/{total} ({pct}%) [{('#' * full) + ('-' * (width - full))}]"
 
 
-def snapshot(paths: list[str], label: str) -> dict:
+def snapshot(paths: list[str], label: str, scope_file: str | None = None) -> dict:
+    if scope_file:
+        return _load_scope(scope_file, label)
     snap = {"at_local": _clock(), "scope": label}
     if paths:
         snap.update(_load_maps(paths))
@@ -109,7 +207,17 @@ def present(snap: dict) -> str:
     lines = [f"Время среды: {snap['at_local']}", f"Область: {snap['scope']}"]
     if not snap["measurable"]:
         lines.append("Прогресс: не рассчитан — " + snap["reason"])
+        if snap.get("stale_sources"):
+            lines.append("Причины: " + "; ".join(snap["stale_sources"][:5]))
         return "\n".join(lines)
+    if "tasks" in snap:
+        task = snap["tasks"]
+        lines.append("Поручения владельца подтверждены: " + _stat(task["done"], task["total"]))
+        if not snap.get("requirements_measurable"):
+            lines.append("Общий процент по требованиям: не рассчитан — " + snap.get("requirements_reason", "данные неполные"))
+            if snap.get("unmapped_tasks"):
+                lines.append("Ожидают учёта в картах: " + ", ".join(snap["unmapped_tasks"][:12]))
+            return "\n".join(lines)
     s, r = snap["slices"], snap["requirements"]
     lines.append("Этапы полностью подтверждены: " + _stat(s["done"], s["total"]))
     lines.append("Требования подтверждены:      " + _stat(r["done"], r["total"]))
@@ -127,12 +235,13 @@ def present(snap: dict) -> str:
 
 def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(description="Точный счётчик прогресса по активным картам требований")
-    parser.add_argument("--map", action="append", default=[], help="Путь к карте требований; повторить для всех карт активного эпика")
+    parser.add_argument("--map", action="append", default=[], help="Путь к карте требований (устаревший выбор только карт одной задачи)")
+    parser.add_argument("--scope-file", help="Проверяемый реестр всех поручений plans/progress_scope.json; нужен для общего прогресса")
     parser.add_argument("--label", default="активное ТЗ", help="Человекочитаемое название области счёта")
     parser.add_argument("--json", action="store_true", help="Отдать структурированные данные")
     args = parser.parse_args(argv)
     try:
-        data = snapshot(args.map, args.label)
+        data = snapshot(args.map, args.label, args.scope_file)
     except (OSError, ValueError) as exc:
         print("ПРОГРЕСС НЕИЗВЕСТЕН: " + str(exc), file=sys.stderr)
         return 2
