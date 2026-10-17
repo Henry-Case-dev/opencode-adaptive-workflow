@@ -201,6 +201,14 @@ Re-run the failing reproduction, repaired mechanism, affected seams and required
 
 If 3 cycles do not converge, report root-cause uncertainty for Architect; do not weaken the requirement or stop the feature.
 
+## Gate v2 evidence for new strict maps
+
+**Strict candidate prerequisite:** before the first `--stage review` on a strict map, freeze the product changes as a **local candidate Git commit** (isolated branch/worktree when appropriate). Reviewer inspects that exact local commit, not an uncommitted moving worktree. Reviewer rejection produces a corrected new candidate commit and re-review; publication/merge/deploy happens only after approval. Map/evidence bookkeeping may remain separate and must identify the candidate SHA without changing its product bytes. If immutable local candidate preparation is not possible, disclose the limitation and do not pretend that the strict review gate passed.
+
+
+When the active requirement map contains `strict_evidence: true`, attach real candidate-bound evidence to the mapped rows using `artifact_path` relative to the project Git root. Promote a compact durable log/report/screenshot reference into the project before claiming `VERIFIED`; include `artifact_sha256` where practical and leave human-readable `ref`/`observation`. Never create an empty evidence file, fake Git hash or vague `passed` note to bypass the gate. Temporary scratch is not persistent evidence. Legacy maps may use the existing evidence convention until deliberately migrated; still provide real observable proof to Reviewer.
+
+
 # Evidence/document hygiene
 
 Never edit `plans/current_task.md` or `plans/workflow_state.md`.

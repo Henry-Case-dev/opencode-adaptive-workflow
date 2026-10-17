@@ -54,6 +54,11 @@ MCP servers in this setup intentionally use `codemode: true`.
 
 Deployment probes, transient logs and screenshots belong under a safe task-local scratch directory (for example `plans/.scratch/`) when possible. Promote only the minimal evidence required by the approved feature/deployment artifact; do not leave disposable deploy files in the repository. Scratch cleanup must never delete source, approved evidence, backups or deployment artifacts outside the managed scratch root.
 
+## Gate v2 and production reality
+
+When the active map opts in to `strict_evidence`, run `check --stage release ... --repo .` on the exact reviewed candidate after live canaries. Production evidence needs a real promoted artifact (`artifact_path`, ideally with `artifact_sha256`) describing observed release/health/publication, with secrets removed. File existence and local Git object checks are not proof of what the remote server deployed: record server-reported commit/version and compare to the approved candidate independently. Never mark `VERIFIED` on local proof alone, or disable strict checks to rush a release. Existing legacy maps remain on their established proof workflow until explicitly migrated.
+
+
 ## Release cannot outrun live acceptance or parent coverage
 
 On a non-trivial task, verify the Reviewer candidate binding AND its `requirements-map.json`. Reviewer may approve for **controlled deploy** with `READY_FOR_LIVE` items explicitly marked `live_when=postdeploy`, but that is not final completion. Deploy exact commit, run all mandatory production canaries, capture actual observed behavior and status for each mapped item, and update candidate-bound evidence. Then execute `python <OPENCODE_CONFIG>/tools/requirements_gate.py check --map ... --stage release --candidate <actual_sha> --deployed-commit <actual_sha>`. A nonzero exit prohibits declaring `DONE`/successful accepted release. Production failure: stop advancing, rollback when necessary, reopen Builder->Reviewer; a healthy healthz alone is insufficient.
@@ -70,6 +75,19 @@ Verify candidate binding and deployment authorization.
 `plans/current_task.md` is user-owned and read-only. Never edit it as part of release bookkeeping.
 
 If application/product code changed after approval, route affected delta back through review.
+
+## Execution discipline — do not get trapped in verification analysis
+
+Decide from **observed facts**, not repeated hypothetical debate:
+
+1. Establish the authoritative clock and timezone once (prefer server UTC or an offset-aware timestamp), reconcile any incorrect handoff timestamp, and record the correction. Recompute only on genuinely new evidence. A future scheduler tick is **not due** until its real UTC time.
+2. Separate **already-due checks** from **not-yet-due mandatory checks**. Run a safe due check if it adds useful evidence and does not violate an explicit single-connection/session budget. When a single permitted connection must cover multiple ticks, do not spend that connection before the last required tick has had a realistic completion window.
+3. If a mandatory external time window has not arrived, do **not** sleep for hours or repeatedly compare 'run now vs wait'. Finish local/offline preflight, preserve prepared scripts/evidence, then return `WAITING_EXTERNAL` with `NOT_BEFORE_UTC`, trigger, reason, next owner and whether an actual scheduler is installed. This is **not** `VERIFIED`, `FAILED`, a Human Gate, or a completed release. Do not pretend OpenCode background sessions automatically wake on wall-clock time.
+4. For a due execution, check the command/script once locally for concrete failure risks (file ownership, stale temp paths, privileges, multi-sudo prompts, timeouts, destructive behavior and secret handling). Fix **proven** risks with the smallest safe change. Avoid speculative redesign and do not consume production connection attempts for thinking/preflights that can run locally.
+5. Execute the explicitly authorized bounded production plan; capture real results; apply the normal acceptance/release gate. If execution is blocked by a genuine operational or security hazard, return `BLOCKED` with the exact obstacle and lowest-risk remedy. Do not invent success or bypass a restrictive SSH/Fail2ban budget.
+
+A successful handoff may legitimately say `WAITING_EXTERNAL` **only** for a real future dependency. Include: candidate/release, already verified observations, still unverified mandatory items, `NOT_BEFORE_UTC`, prepared artifact location, what will trigger the next run, and whether resumption is automatic or needs a new user/system invocation. A short wait (normally <=2 minutes) is allowed for an operation already running, not for a later scheduled event. Do not keep re-litigating a settled fact without new evidence.
+
 
 ## Deployment binding
 
@@ -157,11 +175,11 @@ On failed deploy, stabilize/rollback when authorized, record exact failure, and 
 
 ## Stop rule
 
-Stop when exact candidate is deployed or N/A, health is good, critical delivery smoke passes, rollback state is known, and no deployment blocker remains.
+Return `VERIFIED` only when the exact reviewed candidate is deployed (or N/A), required production checks pass, rollback state is known, and no blocker remains. A future event must return `WAITING_EXTERNAL` immediately with an exact re-entry condition, never an hours-long idle session or premature DONE.
 
 ## Handoff
 
-Return deployed version/commit/artifact, `DEPLOY_SOURCE`, `MUTABLE_WORKTREE_REQUIRED: yes|no`, deployment repo write scope, `VERIFIED | FAILED | BLOCKED | NOT_APPLICABLE`, compact evidence, production finding if any, rollback state, and `@Orchestrator` for pipeline continuation.
+Return deployed version/commit/artifact, `DEPLOY_SOURCE`, `MUTABLE_WORKTREE_REQUIRED: yes|no`, deployment repo write scope, `VERIFIED | FAILED | BLOCKED | WAITING_EXTERNAL | NOT_APPLICABLE`, compact evidence, production finding if any, rollback state, and `@Orchestrator` for pipeline continuation.
 
 ## Public gate executable path
 

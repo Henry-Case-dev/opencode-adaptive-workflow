@@ -39,6 +39,18 @@ MCP servers in this setup intentionally use `codemode: true`.
 
 
 
+## Requirements gate v2 for new task plans
+
+For new non-trivial features, after extracting source requirements and before starting Builder:
+
+1. Create a short machine-readable `slice-graph.json` beside the requirements map (schema `openworkflow-slices-v1`; each slice: `id`, `depends_on` IDs, `write_scope` file paths/globs, testable `acceptance`). The `plan.md` remains the human-readable dependency/wave plan, not the machine's only dependency source.
+2. Set `slice_graph_path: "slice-graph.json"` and `strict_evidence: true` in new `requirements-map.json`; run `check --stage plan` from the project root. Validate graph ownership, dependency cycles and concurrent write scopes. Document intentional serial joins as dependency edges.
+3. Each manual source requirement should include true `source_line`, `source_text_sha256`, and `source_excerpt`. Multiple atomic requirements may cite one line if the source pointer is identical; do not invent a distinct line to evade checks.
+4. Define expected verification artifacts for Builder/Reviewer/DevOps: candidate-bound `evidence` with `ref` (human explanation), `observation` (what happened), `type`, and `artifact_path` (real repo-relative file). The artifact path cannot be a fabricated placeholder. Prefer `artifact_sha256` for final stable reports. Evidence paths, Git objects and content are independently checked later.
+
+**Compatibility:** Do not set strict mode on existing in-flight maps without a deliberate evidence migration. Ordinary checks remain valid and mandatory; legacy prose references need independent Reviewer inspection. Never disable strict mode on a map already opted in to make a check green.
+
+
 ## Feature manifest ownership
 
 For non-trivial work in projects using `plans`, include a compact feature manifest in planning only when it helps recovery/coverage. It maps requirement IDs/passages to stable runtime entrypoints, relevant durable tests and evidence refs. Do not create one for trivial edits and do not pre-fill speculative implementation files that Builder has not actually touched.
@@ -56,6 +68,24 @@ For non-trivial parent tasks, create or reconcile `plans/features/<feature>/requ
 After a revised task arrives, preserve prior requirement IDs, mark real changes/removed items only with a user decision, and map the delta; never blindly rerun prior features. For every required item label `live_required`, `live_when=preprod|postdeploy`, expected evidence and owner slice. Keep statuses to the map schema; the parent is not complete while any item is `READY_FOR_LIVE` or missing proof.
 
 
+## Two-pass decomposition — fidelity first, slicing second
+
+For non-trivial requests use **two distinct decisions** in the same planning pass; do not generate multiple long planning documents:
+
+1. **Extract atomic obligations:** enumerate every independent user-visible requirement, prohibition, fallback, visual constraint, operational invariant and acceptance condition from the original source (including prose/tables/screenshots). Keep stable source references; distinguish requirements from context/duplicates with a specific defensible reason. Only user-approved exclusions can remove mandatory scope. Do not prematurely summarize several distinct obligations into one vague feature label.
+2. **Group obligations into executable slices:** only after the inventory is reconciled, assign each obligation to an owner slice (or multiple slices with explicit integration ownership). Recheck in both directions: every clause belongs somewhere and every slice has a bounded observable outcome.
+
+**Slice sizing test** (use engineering boundaries, not artificial LOC/file quotas):
+
+- One slice has **one coherent independently testable outcome**, a clear owner, a finite acceptance test and an integration point; multiple internal edits are fine if they cannot deliver value separately.
+- **Split** when distinct acceptance outcomes can be delivered/reviewed separately, or when unrelated failure modes/subsystems can be isolated without inventing brittle contracts. A broad UI/backend/DB ticket with many unrelated acceptances is not 'small' merely because Builder can spawn children.
+- **Keep together** tightly coupled changes that cannot be independently tested or would require unnecessary unstable interfaces. Do not spawn dozens of microtasks or extra PM/Architect passes just to comply with a count.
+- Enumerate cross-slice prerequisites, contract freeze points and join barriers. Validate that each dependency refers to a real slice, the dependency graph has no cycle, and simultaneous writer scopes do not overlap. If uncertain, serialize; never assert `CAN_PARALLEL_WITH` on guesswork.
+- Each slice needs acceptance phrased as an **observable behavior** (including failure/rollback/live evidence when relevant), not 'implemented', 'covered by tests' or 'works'. An epic is not finished merely because every named slice passed if a source clause never became a slice.
+
+On substantial plans, make one short reverse-source coverage check **before BUILD** (independent Reviewer when the parent workflow requires it). Reuse that result for unchanged requirements, not a ritual review for every trivial patch.
+
+
 # Mandatory requirement mapping
 
 For every non-trivial parent task, build/maintain a compact requirement map before declaring planning complete.
@@ -64,7 +94,11 @@ Every explicit requirement must map to exactly one or more implementation slices
 
 Status per requirement:
 
-`UNASSIGNED | PLANNED | BUILDING | REVIEW | VERIFIED | BLOCKED_REAL_HUMAN_GATE | FAILED`
+For required map rows the accepted states are:
+
+`PENDING | BUILDING | REVIEW | VERIFIED | BLOCKED_REAL_HUMAN_GATE | FAILED | READY_FOR_LIVE`
+
+A source inventory row without assigned ownership uses `disposition: unassigned` and blocks planning. Do not write `PLANNED` or `UNASSIGNED` into the `status` field: the gate rejects them.
 
 No requirement may disappear because a feature packet was smaller than the original request.
 

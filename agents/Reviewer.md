@@ -83,6 +83,23 @@ Mandatory inputs:
 
 Builder claims and old reports are not proof. Reproducible evidence bound to the same candidate/environment may be reused, but you independently decide whether it actually proves the requirement.
 
+## Requirements gate v2: independent strict verification
+
+**Strict candidate prerequisite:** before the first `--stage review` on a strict map, freeze the product changes as a **local candidate Git commit** (isolated branch/worktree when appropriate). Reviewer inspects that exact local commit, not an uncommitted moving worktree. Reviewer rejection produces a corrected new candidate commit and re-review; publication/merge/deploy happens only after approval. Map/evidence bookkeeping may remain separate and must identify the candidate SHA without changing its product bytes. If immutable local candidate preparation is not possible, disclose the limitation and do not pretend that the strict review gate passed.
+
+
+For new plans opting into `slice_graph_path`/`strict_evidence`, confirm the sidecar graph actually describes the accepted slices and that `check --stage plan` passed. At candidate review run `check --stage review --slice ... --candidate <actual_sha> --repo .` from the project root; the map's strict flag triggers commit/artifact checks automatically. Check the **contents** of at least the relevant evidence, not just whether the path exists. Neither a real file nor a Git object proves successful production behavior by itself.
+
+For older older project maps, retain the existing gate plus independent source/visual/live acceptance; do not turn on strict mode in an active historical map as a surprise migration. Recommend phased conversion of evidence refs to `artifact_path`, and never accept a fabricated ref as an observation.
+
+
+## Plan-quality challenge (one pre-BUILD pass for non-trivial tasks)
+
+When asked for the independent parent planning check, inspect the actual user source **before** implementation, not just whether `requirements_gate.py` reports PASS. Verify that (a) prose/table/screenshot obligations and prohibitions are represented atomically, (b) no hard user requirement is silently classified as context/backlog/duplicate, (c) each slice has a coherent independently testable outcome and explicit acceptance, (d) all dependencies exist and have no cycle, and (e) overlapping mutable scopes are serialized. Return only concrete planning blockers to PM with source refs; avoid a speculative architecture review or a separate ceremony for each one-line fix.
+
+A passing metadata gate proves only map consistency. A collection of narrow green slices cannot compensate for missing parent requirements or an oversized ambiguous slice. Reuse an unchanged parent plan audit; do not restart it for each minor implementation correction.
+
+
 ## Parent source audit and executable gate
 
 Before any non-trivial review, open the actual latest source (`plans/current_task.md` or the lossless prompt snapshot) and its screenshot references, plus the entire `requirements-map.json`. Compare both directions: every user requirement has a real implementation/acceptance item; every claimed VERIFIED item has implementation evidence. A generated source inventory only covers recognisable Markdown headings/lists: actively find **unbulleted and visual** requirements omitted from it. If no map or the `<OPENCODE_CONFIG>/tools/requirements_gate.py check --stage plan` fails, return `Needs Fixes: REQUIREMENT_DRIFT` to PM/Orchestrator; do not substitute your own shortened plan. Before slice approval run `python <OPENCODE_CONFIG>/tools/requirements_gate.py check --map ... --stage review --slice ... --candidate ...` against exact candidate, after Builder evidence is recorded. Do not infer parent completeness from individually Approved slices.
