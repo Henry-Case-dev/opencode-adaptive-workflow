@@ -29,6 +29,48 @@ INVENTORY_PATTERN = re.compile(r"^\s*(?:#{2,5}\s+|[-*+]\s+|(?:\d+[.)]|[A-Z]\d+[.
 REQUIRED = {"required"}
 OTHER = {"context", "duplicate", "user_excluded"}
 STATES = {"PENDING", "BUILDING", "REVIEW", "VERIFIED", "FAILED", "BLOCKED_REAL_HUMAN_GATE", "READY_FOR_LIVE"}
+# Absent on legacy rows means the original, mandatory engineering acceptance.
+TIERS = {"engineering", "owner_optional"}
+
+
+def optional_owner_check(row: dict) -> bool:
+    return row.get("verification_tier", "engineering") == "owner_optional"
+
+
+def validate_optional_row(row: dict, reqids: dict, repo: Path, errors: list[str]) -> None:
+    """Never treat implementation or mandatory live evidence as waived by a manual feedback label."""
+    rid = str(row.get("req_id", row.get("source_id", "?")))
+    if row.get("verification_tier", "engineering") not in TIERS:
+        errors.append(f"{rid}: unsupported verification_tier")
+        return
+    if not optional_owner_check(row):
+        return
+    if row.get("live_required") is not False:
+        errors.append(f"{rid}: owner_optional requires live_required=false")
+    if row.get("status") in {"FAILED", "BLOCKED_REAL_HUMAN_GATE"}:
+        errors.append(f"{rid}: FAILED/Human Gate cannot be ignored as optional owner feedback")
+    reason = str(row.get("owner_optional_reason", "")).strip()
+    if len(reason) < 16:
+        errors.append(f"{rid}: optional owner feedback needs specific owner_optional_reason")
+    policy = row.get("owner_policy_ref")
+    if not isinstance(policy, str) or not policy.strip():
+        errors.append(f"{rid}: optional owner feedback needs owner_policy_ref")
+    else:
+        ref = Path(policy)
+        base = repo.resolve()
+        target = (base / ref).resolve() if not ref.is_absolute() else ref.resolve()
+        if not target.is_relative_to(base) or not target.is_file():
+            errors.append(f"{rid}: owner_policy_ref not an existing project file: {policy}")
+    links = row.get("engineering_req_ids")
+    if not isinstance(links, list) or not links or any(not isinstance(x, str) or not x for x in links):
+        errors.append(f"{rid}: optional owner feedback requires engineering_req_ids")
+    else:
+        for link in links:
+            target = reqids.get(link)
+            if target is None or optional_owner_check(target) or link == rid:
+                errors.append(f"{rid}: missing or non-engineering acceptance counterpart {link}")
+
+
 
 
 def sha(s: bytes) -> str:
@@ -166,12 +208,18 @@ def check(args) -> int:
             prior = reqids[rid]
             if (str(prior.get("slice", "")).strip() != owning_slice or
                 str(prior.get("acceptance", "")).strip() != str(row.get("acceptance", "")).strip() or
-                prior.get("status") != row.get("status")):
+                prior.get("status") != row.get("status") or
+                prior.get("verification_tier", "engineering") != row.get("verification_tier", "engineering")):
                 errors.append(f"{rid}: duplicate req_id with inconsistent owner/acceptance/status")
         elif rid:
             reqids[rid] = row
         if args.stage == "release" or (args.stage == "review" and row.get("slice") == args.slice):
             scoped_required.append(row)
+    # Fail closed: old rows remain mandatory. New owner-optional classifications
+    # require an auditable user policy and at least one separately verified engineering obligation.
+    for row in listed + manual:
+        if row.get("disposition") == "required":
+            validate_optional_row(row, reqids, Path(args.repo), errors)
     graph_ref = args.graph or data.get("slice_graph_path")
     if graph_ref:
         gp = Path(graph_ref)
@@ -190,6 +238,11 @@ def check(args) -> int:
             verify_real_commit(Path(args.repo), args.candidate or "", errors, "candidate")
         for row in scoped_required:
             rid = row.get("req_id", row.get("source_id", "?"))
+            if optional_owner_check(row):
+                # Owner chose non-blocking personal observation. This does not
+                # mark the feature VERIFIED: referenced engineering rows still
+                # pass regular review/release evidence and status checks.
+                continue
             postdeploy = bool(row.get("live_required")) and row.get("live_when") == "postdeploy"
             allowed = {"VERIFIED"}
             if args.stage == "review" and postdeploy:

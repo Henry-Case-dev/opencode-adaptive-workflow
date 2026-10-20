@@ -23,10 +23,16 @@ TASK_STATES = {"PENDING", "BUILDING", "REVIEW", "READY_FOR_LIVE", "WAITING_EXTER
 KNOWN_STATES = {"PENDING", "BUILDING", "REVIEW", "VERIFIED", "FAILED", "BLOCKED_REAL_HUMAN_GATE", "READY_FOR_LIVE"}
 
 
+def optional_owner_check(row: dict) -> bool:
+    return row.get("verification_tier", "engineering") == "owner_optional"
+
+
+
 def _load_maps(paths: list[str], namespaces: dict[Path, str] | None = None) -> dict:
     statuses: dict[tuple[str, str], str] = {}
     owners: dict[str, set[tuple[str, str]]] = defaultdict(set)
     duplicates = 0
+    optional_statuses = {}
     paths_seen = set()
     ordered_paths: list[str] = []
     for raw_path in paths:
@@ -59,7 +65,29 @@ def _load_maps(paths: list[str], namespaces: dict[Path, str] | None = None) -> d
                 raise ValueError(f"обязательное требование без ID/владельца (строка {i}): {p}")
             if state not in KNOWN_STATES:
                 raise ValueError(f"неизвестный статус {state} для требования {rid}: {p}")
+            if row.get("verification_tier", "engineering") not in {"engineering", "owner_optional"}:
+                raise ValueError(f"неизвестный verification_tier у {rid}: {p}")
+            # The progress reader must not trust an unchecked optional label.
+            # Require the same simple preconditions as the gate before excluding a row.
+            if optional_owner_check(row):
+                links = row.get("engineering_req_ids")
+                if (row.get("live_required", False) is not False or
+                    not row.get("owner_policy_ref") or
+                    len(str(row.get("owner_optional_reason", "")).strip()) < 16 or
+                    not isinstance(links, list) or not links):
+                    raise ValueError(f"непроверенная классификация необязательной проверки {rid}: {p}")
+                key = (str(p), rid)
+                if key in statuses:
+                    raise ValueError(f"одно требование не может быть и обязательным, и добровольным: {rid} в {p}")
+                if key in optional_statuses and optional_statuses[key] != state:
+                    raise ValueError(f"у необязательной проверки два статуса: {rid} в {p}")
+                optional_statuses[key] = state
+                if state in {"FAILED", "BLOCKED_REAL_HUMAN_GATE"}:
+                    raise ValueError(f"проблема в необязательной проверке {rid}: требуется анализ дефекта")
+                continue
             key = (str(p), rid)
+            if key in optional_statuses:
+                raise ValueError(f"одно требование не может быть и обязательным, и добровольным: {rid} в {p}")
             if key in statuses:
                 duplicates += 1
                 # Contradictory duplicates are data quality defects, not two requirements.
@@ -69,6 +97,22 @@ def _load_maps(paths: list[str], namespaces: dict[Path, str] | None = None) -> d
                 statuses[key] = state
             owner_key = (namespaces.get(p, "legacy") if namespaces else "legacy", owner)
             owners[owner_key].add(key)
+    # Reference integrity for all optional rows, including across two maps of one epic:
+    # only listed engineering requirements can justify treating feedback as optional.
+    for raw_path in ordered_paths:
+        p = Path(raw_path)
+        map_engineering_rids = {key[1] for key in statuses if key[0] == str(p)}
+        data = json.loads(p.read_text(encoding="utf-8-sig"))
+        for row in data.get("items", []) + data.get("additional_requirements", []):
+            if row.get("disposition") == "required" and optional_owner_check(row):
+                if not all(isinstance(x, str) and x in map_engineering_rids
+                           for x in row["engineering_req_ids"]):
+                    raise ValueError(f"owner_optional без инженерной пары: {row.get('req_id')} в {p}")
+                policy = Path(row["owner_policy_ref"])
+                if not policy.is_absolute():
+                    policy = Path.cwd() / policy
+                if not policy.is_file():
+                    raise ValueError(f"не найден owner_policy_ref у {row.get('req_id')}: {policy}")
     if not statuses:
         raise ValueError("нет обязательных требований в выбранных картах")
     stat_counts = Counter(statuses.values())
@@ -79,6 +123,9 @@ def _load_maps(paths: list[str], namespaces: dict[Path, str] | None = None) -> d
         "slices": {"done": done_slices, "total": len(owners)},
         "requirements": {"done": completed_req, "total": len(statuses)},
         "statuses": dict(sorted(stat_counts.items())),
+        "owner_optional_checks": {"total": len(optional_statuses),
+                                  "pending": sum(x != "VERIFIED" for x in optional_statuses.values()),
+                                  "verified": sum(x == "VERIFIED" for x in optional_statuses.values())},
         "unverified": len(statuses) - completed_req,
         "duplicates_collapsed": duplicates,
     }
@@ -229,6 +276,10 @@ def present(snap: dict) -> str:
     if blocked: parts.append(f"требуют решения пользователя: {blocked}")
     if failed: parts.append(f"с ошибкой: {failed}")
     if parts: lines.append("Отдельно: " + "; ".join(parts))
+    optional = snap.get("owner_optional_checks", {})
+    if optional.get("total"):
+        lines.append(f"Необязательная обратная связь владельца: {optional['pending']} ожидают, "
+                     f"{optional['verified']} просмотрены (вне знаменателя и без блокировки DONE).")
     lines.append("Источник счёта: только переданные карты; статусы не являются проверкой кода/production.")
     return "\n".join(lines)
 

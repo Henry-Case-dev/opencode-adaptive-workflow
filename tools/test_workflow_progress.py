@@ -172,6 +172,46 @@ class WorkflowProgressTests(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, "неизвестный статус"):
             progress.snapshot([a], "epic")
 
+    def test_owner_optional_is_separate_from_engineering_progress(self):
+        policy = self.root / "owner_live_checks.md"
+        policy.write_text("Personal checks optional", encoding="utf8")
+        p = self.root / "map.json"
+        data = {"schema": progress.SCHEMA, "items": [
+            {"disposition":"required", "req_id":"R1", "slice":"S1", "status":"VERIFIED"},
+            {"disposition":"required", "req_id":"O1", "slice":"S1", "status":"READY_FOR_LIVE",
+             "live_required":False, "verification_tier":"owner_optional",
+             "owner_policy_ref": str(policy), "owner_optional_reason":"Voluntary owner subjective client feedback",
+             "engineering_req_ids":["R1"]}]}
+        p.write_text(json.dumps(data), encoding="utf8")
+        snap = progress.snapshot([str(p)], "проект")
+        self.assertEqual(snap["requirements"], {"done":1,"total":1})
+        self.assertEqual(snap["slices"], {"done":1,"total":1})
+        self.assertEqual(snap["owner_optional_checks"], {"total":1,"pending":1,"verified":0})
+        self.assertIn("100%", progress.present(snap))
+        self.assertIn("Необязательная", progress.present(snap))
+        src, fp = self.source("task.md", "Task")
+        scope = self.write_scope([{"id":"T1", "status":"VERIFIED", "source_path":src,
+                                   "source_sha256":fp, "maps":[str(p)], "coverage_complete":True}])
+        self.assertTrue(progress.snapshot([], "проект", scope)["measurable"])
+
+    def test_owner_optional_cannot_hide_failure_or_absent_peer(self):
+        p = self.root / "policy.md"
+        p.write_text("Personal checks optional", encoding="utf8")
+        m = self.root / "map.json"
+        data = {"schema": progress.SCHEMA, "items": [
+            {"disposition":"required", "req_id":"O1", "slice":"S1", "status":"READY_FOR_LIVE",
+             "live_required":False, "verification_tier":"owner_optional", "owner_policy_ref":str(p),
+             "owner_optional_reason":"Voluntary owner subjective client feedback", "engineering_req_ids":["GHOST"]},
+            {"disposition":"required", "req_id":"R1", "slice":"S1", "status":"VERIFIED"}]}
+        m.write_text(json.dumps(data), encoding="utf8")
+        with self.assertRaisesRegex(ValueError, "без инженерной пары"):
+            progress.snapshot([str(m)], "p")
+        data["items"][0]["engineering_req_ids"] = ["R1"]
+        data["items"][0]["status"] = "FAILED"
+        m.write_text(json.dumps(data), encoding="utf8")
+        with self.assertRaisesRegex(ValueError, "проблема в необязательной проверке"):
+            progress.snapshot([str(m)], "p")
+
     def test_full_verified_is_100_percent(self):
         a = self.write_map("main.json", [("M1", "W1", "VERIFIED"), ("M2", "W2", "VERIFIED")])
         lines = progress.present(progress.snapshot([a], "task"))
@@ -181,8 +221,8 @@ class WorkflowProgressTests(unittest.TestCase):
         a = self.write_map("main.json", [("M1", "W1", "VERIFIED")])
         out = io.StringIO()
         with contextlib.redirect_stdout(out):
-            self.assertEqual(progress.main(["--map", a, "--json", "--label", "SOUL"]), 0)
-        self.assertEqual(json.loads(out.getvalue())["scope"], "SOUL")
+            self.assertEqual(progress.main(["--map", a, "--json", "--label", "sample"]), 0)
+        self.assertEqual(json.loads(out.getvalue())["scope"], "sample")
 
 
 if __name__ == "__main__":

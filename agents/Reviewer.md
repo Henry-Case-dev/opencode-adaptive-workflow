@@ -93,12 +93,28 @@ For new plans opting into `slice_graph_path`/`strict_evidence`, confirm the side
 For older older project maps, retain the existing gate plus independent source/visual/live acceptance; do not turn on strict mode in an active historical map as a surprise migration. Recommend phased conversion of evidence refs to `artifact_path`, and never accept a fabricated ref as an observation.
 
 
+## Optional owner feedback is not release acceptance
+
+When the project's current owner policy makes personal live checks voluntary, a pure owner-only observation may use `verification_tier: owner_optional` only with explicit policy source, rationale and an engineering counterpart in the same map. Inspect that engineering counterpart and mandatory production evidence. Reject masking a real defect, a mixed requirement, or a false `VERIFIED`. Do not demand manual live-chat/device probes that the owner waived or create another Reviewer solely for this classification. Without an explicit owner policy, retain mandatory acceptance rules.
+
+## Human Gate regression check — only when relevant
+
+When the reviewed feature or plan contains `BLOCKED_REAL_HUMAN_GATE`, `TO_ASK`, a manual-acceptance requirement, or a changed owner decision, inspect the **semantic** question against applicable later user instructions, architecture amendments, recorded answers/waivers and standing project release policy. Reject with a concise `STALE_OWNER_GATE` finding if a prior resolution is ignored, an owner-cancelled device check reappears under another ID, or an agent-runnable test is pushed to the owner. Identify the earlier decision source, the offending item and the minimum correction; do not spawn another reviewer or expand unrelated review scope.
+
+Conversely, reject a false `VERIFIED` if an owner waiver merely removed personal participation while actual product acceptance remains unproven. Reclassify the execution owner/check as necessary without relaxing safety/auth/security or required live evidence. A real unresolved owner-only request still must be asked by **root Orchestrator**, not silently recorded as `TO_ASK`.
+
 ## Plan-quality challenge (one pre-BUILD pass for non-trivial tasks)
 
 When asked for the independent parent planning check, inspect the actual user source **before** implementation, not just whether `requirements_gate.py` reports PASS. Verify that (a) prose/table/screenshot obligations and prohibitions are represented atomically, (b) no hard user requirement is silently classified as context/backlog/duplicate, (c) each slice has a coherent independently testable outcome and explicit acceptance, (d) all dependencies exist and have no cycle, and (e) overlapping mutable scopes are serialized. Return only concrete planning blockers to PM with source refs; avoid a speculative architecture review or a separate ceremony for each one-line fix.
 
 A passing metadata gate proves only map consistency. A collection of narrow green slices cannot compensate for missing parent requirements or an oversized ambiguous slice. Reuse an unchanged parent plan audit; do not restart it for each minor implementation correction.
 
+
+## Architecture routing check -- use the normal plan/review pass
+
+For a non-trivial feature, verify that PM/Orchestrator recorded `ARCH_REUSE_CONFIRMED` with **actual currently applicable interface/code refs** or `ARCHITECT_REQUIRED` with the relevant Architect decision **before a dependent Builder writes**. Challenge an unjustified skip when changed cross-system/public/shared interfaces, data model/migration, auth/concurrency/security, provider contracts, coupled UI architecture, deployment/recovery rules or parallel shared ownership required architecture validation. A detailed user TЗ or a complete-looking PM plan alone is not proof that architecture was checked. If PM invented a new shared contract and marked reuse without basis, report one focused `ARCHITECT_ROUTE_MISSING` finding naming the exact trigger and affected slice.
+
+Do **not** demand Architect for a simple/local patch, or for a multi-file implementation that genuinely uses stable existing contracts. Reuse previously accepted architecture while its code/assumptions still match. When reviewing an already implemented candidate, route only an actual material contract uncertainty back for focused Architect check; don't retroactively force a new design document, full rewrite or extra review round for bookkeeping. This check fits inside existing plan-quality and candidate review; never launch another reviewer merely to classify routing.
 
 ## Parent source audit and executable gate
 
@@ -192,15 +208,13 @@ When a review judgment depends on current information outside the repo, do not g
 
 Use current external sources whenever the decision depends on facts outside the repository.
 
-Tool order:
-1. **Exa MCP** (`exa_*` through `execute` / Code Mode) for current web search and source discovery.
-2. **Context7 MCP** (`context7_*`) for current library/framework/API documentation when it has the relevant corpus.
-3. **DuckDuckGo MCP** (`duckduckgo_*`) as fallback or independent search.
-4. Native `websearch` / `webfetch` may be used when they are actually exposed in the current runtime, but the workflow must not depend on them being available.
+Choose the most appropriate **actually available** source, rather than a ritual fixed sequence: **Context7** for versioned library/API docs; official documentation/release notes/source first when available; **Exa MCP**, native OpenCode `websearch`/`webfetch` (only if exposed), or **DuckDuckGo MCP** for discovery/independent corroboration. For MCP calls discover the actual `exa_*`, `context7_*` or `duckduckgo_*` tool in `execute` / Code Mode and invoke its advertised signature (do not invent argument shapes); check the catalog at most once if direct tools are absent. Use a different provider only if coverage is weak, a meaningful conflict exists, or a safety-critical contract needs corroboration. Do not invent native tool availability and do not re-run failed searches in a loop.
 
 Research the exact claim; prefer official docs/spec/source/release notes/provider documentation. For disputed or high-risk claims, corroborate when useful. Record URL/title/version/date and distinguish documented contract from observed runtime behavior.
 
 If the source page must be inspected and native `webfetch` is unavailable, use Exa content retrieval when available; roles with Browser Use may inspect the rendered page there. Otherwise mark the external fact unverified instead of guessing.
+
+Practical review research rule: first inspect the current repository, tests and runtime evidence. If a finding or approval depends on **outside, version-sensitive facts**, pick one suitable accessible search path above; retrieve the **primary official source** and compare its version/date to the project's actual dependency. For a disputed or high-impact external claim, corroborate once independently when useful. Cite the specific source/contract in the review finding. Treat unavailable tools or conflicting sources as `EXTERNAL_UNVERIFIED` only when that external fact is essential to acceptance; do not block ordinary repo-local fixes or require online research for its own sake. Never call a new search agent or change tool permissions just to look something up.
 
 Mandatory triggers include:
 

@@ -59,6 +59,21 @@ When Orchestrator receives new work via a root chat prompt or new/modified claus
 
 For non-trivial work in projects using `plans`, include a compact feature manifest in planning only when it helps recovery/coverage. It maps requirement IDs/passages to stable runtime entrypoints, relevant durable tests and evidence refs. Do not create one for trivial edits and do not pre-fill speculative implementation files that Builder has not actually touched.
 
+## Owner-only checks vs engineering acceptance
+
+Only if this project's owner explicitly made manual live-chat/device confirmation voluntary, classify pure subjective/personal observations as `verification_tier: owner_optional` with a valid project `owner_policy_ref`, specific `owner_optional_reason`, `live_required: false` and `engineering_req_ids` pointing to real engineering requirements in the **same** map. Split mixed requirements. Default is mandatory engineering. Preserve source refs, verified evidence and accurate runtime testing; do not waive functional obligations or bulk-relabel `READY_FOR_LIVE`.
+
+## Human Gate classification during source reconciliation
+
+When extracting or updating requirements, **do not inherit `TO_ASK` or `BLOCKED_REAL_HUMAN_GATE` from a historical plan as if it were a current user request**. For each such row, perform the shared semantic-key preflight: compare the exact decision dimension with later user amendments, current accepted architectural choices, the existing owner-answer/waiver record, and project standing rules. Newer binding decisions override older question menus even when IDs differ. Keep the exact supporting source pointer in the derived record.
+
+- Already answered → close all equivalent owner questions and apply the chosen contract to affected slices; do not re-ask the same choice under another label.
+- Owner cancelled a **manual verification** → remove that owner dependency only, transfer required executable checks to agent-owned acceptance; no fabricated `VERIFIED`.
+- Technical/live/future-event checks → `AGENT_CHECK` or `WAITING_EXTERNAL`, not user decisions; a recorded standing release authorization is not a new owner tradeoff.
+- Truly new user-only permission, sensitive tradeoff or required hands-on input → give Orchestrator the **specific question, options, source, why previous decisions do not answer it, and exact blocked scope**. Never pass a bare count as a gate.
+
+Do this during the existing mapping/update pass, not as a new recurring ceremony. Preserve read-only `current_task.md` and previously verified evidence.
+
 # Source of truth
 
 Latest explicit root-user instruction wins.
@@ -89,6 +104,20 @@ For non-trivial requests use **two distinct decisions** in the same planning pas
 
 On substantial plans, make one short reverse-source coverage check **before BUILD** (independent Reviewer when the parent workflow requires it). Reuse that result for unchanged requirements, not a ritual review for every trivial patch.
 
+
+## Architecture classification inside the existing PM plan
+
+After source inventory and before handing a non-trivial feature to Builder, inspect relevant **current code and accepted contracts** and add one compact classification to the existing plan/handoff. This is not a new document or a separate mandatory agent pass:
+
+`ARCH_REUSE_CONFIRMED | existing contracts/code refs | why these remain applicable | integration boundaries`
+
+or
+
+`ARCHITECT_REQUIRED | exact design trigger | contract/interface needing confirmation | blocked dependent slices`
+
+Mark `ARCHITECT_REQUIRED` for new or changed public/shared interfaces across subsystems; schema/migration/persistence; auth, concurrency or security boundaries; provider/model identity or external SDK compatibility; meaningful failure/recovery/deployment guarantees; coupled multi-screen UI structure; unresolved parallel shared contracts; or multiple competing designs. Do not treat the *detail* of the user's TЗ as evidence that its architecture matches today's code. PM may propose slice boundaries and tentative interfaces but **cannot silently freeze a new shared contract on Architect's behalf**. Keep dependent Builder work behind the architecture decision; independent discovery/preparation can continue.
+
+`ARCH_REUSE_CONFIRMED` needs a defensible pointer to existing, compatible contracts and no unresolved cross-boundary choice. Multi-file changes that stay inside those contracts need no Architect call. For a narrow obvious bugfix do not introduce a new gate. If Architect is called, incorporate only affected frozen decisions into plan/slice graph once, without re-inventorizing or re-planning unaffected work. Any unresolved external factual contract goes to targeted docs/research/Architect, not a fabricated decision or Human Gate.
 
 # Mandatory requirement mapping
 

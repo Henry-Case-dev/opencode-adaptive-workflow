@@ -72,6 +72,47 @@ class GateTests(unittest.TestCase):
         self.run_gate("check", "--map", str(self.map), "--stage", "review", "--slice", "A", "--candidate", "a"*40, expected=0)
         self.run_gate("check", "--map", str(self.map), "--stage", "release", "--candidate", "a"*40, "--deployed-commit", "a"*40, expected=1)
 
+    def test_optional_owner_feedback_does_not_block_release_if_engineering_verified(self):
+        self.configure()
+        (self.path / "owner_live_checks.md").write_text("Owner made client testing voluntary", encoding="utf8")
+        row = self.data["items"][1]
+        row.update(verification_tier="owner_optional", live_required=False,
+                   owner_policy_ref="owner_live_checks.md",
+                   owner_optional_reason="Voluntary personal Telegram observation only",
+                   engineering_req_ids=[self.data["items"][0]["req_id"]],
+                   status="READY_FOR_LIVE", evidence=[])
+        self.save()
+        self.run_gate("check", "--map", str(self.map), "--stage", "plan", "--repo", str(self.path), expected=0)
+        self.run_gate("check", "--map", str(self.map), "--stage", "review", "--slice", "A", "--candidate", "a"*40,
+                      "--repo", str(self.path), expected=0)
+        self.run_gate("check", "--map", str(self.map), "--stage", "release", "--candidate", "a"*40,
+                      "--deployed-commit", "a"*40, "--repo", str(self.path), expected=0)
+        # The engineering row is still mandatory; do not mistake optional feedback for a waiver.
+        self.data["items"][0]["status"] = "READY_FOR_LIVE"
+        self.save()
+        self.run_gate("check", "--map", str(self.map), "--stage", "release", "--candidate", "a"*40,
+                      "--deployed-commit", "a"*40, "--repo", str(self.path), expected=1)
+
+    def test_owner_optional_without_owner_policy_or_engineering_peer_is_rejected(self):
+        self.configure()
+        row = self.data["items"][1]
+        row.update(verification_tier="owner_optional", live_required=False, status="READY_FOR_LIVE",
+                   owner_optional_reason="Voluntary personal Telegram observation only",
+                   engineering_req_ids=["GHOST"], owner_policy_ref="absent.md")
+        self.save()
+        self.run_gate("check", "--map", str(self.map), "--stage", "plan", "--repo", str(self.path), expected=1)
+
+    def test_failed_optional_observation_is_never_ignored(self):
+        self.configure()
+        (self.path / "owner_live_checks.md").write_text("Owner made client testing voluntary", encoding="utf8")
+        self.data["items"][1].update(verification_tier="owner_optional", live_required=False,
+                   owner_policy_ref="owner_live_checks.md",
+                   owner_optional_reason="Voluntary personal Telegram observation only",
+                   engineering_req_ids=[self.data["items"][0]["req_id"]], status="FAILED")
+        self.save()
+        self.run_gate("check", "--map", str(self.map), "--stage", "release", "--candidate", "a"*40,
+                      "--deployed-commit", "a"*40, "--repo", str(self.path), expected=1)
+
     def test_unapproved_exclusion_rejected(self):
         self.configure()
         self.data["items"][0].update(disposition="user_excluded", reason="not needed per user")

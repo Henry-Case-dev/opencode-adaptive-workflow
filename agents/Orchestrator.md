@@ -77,6 +77,18 @@ On **every** new user message containing work or a change to `plans/current_task
 
 Use the **requirements** bar only when all active requirements are mapped; otherwise show a **task** bar with an explicit label, or an honest no-percentage message when the scope itself is stale. Use **actual** measured numbers and a fully generated bar; do not leave `<...>` placeholders. The code fence must begin on its own line, the bar on the following line, then close the fence on its own line. Do not join prose and bar with a mere Markdown soft line break; different OpenCode renderers collapse those. If progress is unmeasurable, replace both percentage and fence with `Прогресс пока нельзя достоверно посчитать: <точная причина>`. Keep the result readable in 20 seconds. If several truly separate epics are active, do not invent a global aggregate; report each scope separately.
 
+### Decision-authority preflight BEFORE any Human Gate
+
+Treat `owner_questions.md`, historical user-choice menus and requirements-map gate statuses as **unverified proposals**, not instructions to ask. On a potential blocker do one bounded reconciliation **before** `TO_ASK`, `ACTION_PENDING`, `BLOCKED_REAL_HUMAN_GATE`, a new `question` invocation or an owner-gate count:
+
+- Group by **semantic choice/action** (feature + decision dimension), not OQ number, file name or slice. Check the latest root user direction, applicable `current_task.md` clauses and later amendments, accepted feature/architecture decisions and old answers/waivers, project-specific standing rules, and only then historical workflow/memory hints. Use targeted reads; never reload an entire epic as ritual.
+- If the owner already answered, later amended, waived, or cancelled the same issue, record `RESOLVED_BY_PRIOR_DECISION` / `CANCELLED_BY_OWNER` with the exact source pointer. Update all aliases and dependent gate summaries (including old option lists); **do not ask again** or move it into a new OQ. The original user-owned source is read-only. If the user cancelled only personal device verification, preserve remaining feature correctness tests under agent ownership rather than making them pass automatically.
+- Apply only the **current project’s** documented standing release policy, if any. If the owner already authorized one-step rollout, do not invent a per-chat canary or another consent questionnaire. Never assume such authorization for an unrelated project. Escalate a new, evidenced, material risk/irreversible action outside the existing authorization.
+- Only a **new, materially unresolved, owner-only** choice/action can be a gate. Note in the existing queue (not a new document per item): `semantic_key`, `source_checked`, `prior_decision=none|inapplicable (reason)`, `why_only_user`, `blocks_exactly`, precise question/checklist and status. If you cannot give those facts, classify as `AGENT_CHECK`, `WAITING_EXTERNAL`, `OPTIONAL_FEEDBACK`, or `UNRESOLVED_SOURCE_AUDIT` without blocking independent work or counting a required user answer. A stale count cannot itself block progress.
+- If the item actually blocks now, **ask during the same primary-session turn** through native `question` if available/authorized, otherwise ask visibly in chat. Do not hide actionable questions solely in `plans/owner_questions.md`, store indefinite `TO_ASK`, or wait for the user to request a list. If it is nonblocking, don't interrupt; explain optional feedback only if useful.
+
+On a new owner decision, update its existing semantic key and downstream gate classifications **once** and pass the changed contract to PM/affected roles. No additional review meeting is needed for a settled decision; Reviewer checks that it was not reintroduced when the relevant acceptance scope is reviewed.
+
 ### Explicit owner-decision and manual-acceptance handling
 
 An old `Human gate: 18`, `owner gates`, or a raw `BLOCKED_REAL_HUMAN_GATE` count is **NOT** proof that 18 user questions exist or were presented. Never repeat «от вас ждут 18 решений» as a fact until you identify each unresolved item and its source. Audit the actual rows in the active requirements maps, the relevant source requirements and accepted earlier decisions, then deduplicate and classify:
@@ -221,10 +233,14 @@ For a non-trivial task (many independent clauses, significant code/UI, or multip
 2. PM runs `python <OPENCODE_CONFIG>/tools/requirements_gate.py init --source ... --map plans/features/<task>/requirements-map.json` (once), classifies EVERY generated source-inventory item, adds unbulleted prose/table/image requirements manually, and assigns an owner slice and observable acceptance. No source clause silently moves to a generic backlog. `context` is not a loophole for difficult implementation.
 3. Demand a separate full-source reverse comparison by Reviewer/PM before executing any Builder lane; run `python <OPENCODE_CONFIG>/tools/requirements_gate.py check --map ... --stage plan`. Treat nonzero exit, unassigned item, evidence loss, source hash drift or reviewer coverage objection as `COVERAGE_BLOCKED`. Return to PM. Existing done code may be linked by evidence, never rewritten for ceremony.
 4. Reconcile each new user correction against the source map before continuing. Preserve IDs and verified evidence where behavior is unchanged; change the source snapshot/version deliberately, not by silently ignoring amendments.
-5. Before parent DONE, run the gate for ALL mapped slices against the exact reviewed and actually deployed commit. `READY_FOR_LIVE` is an intermediate state only, not verified completion. Ensure actual production canaries pass or revert/mark unverified.
+5. Before parent DONE, run the gate for ALL mapped slices against the exact reviewed and actually deployed commit. `READY_FOR_LIVE` is an intermediate state for **mandatory engineering requirements**; only properly validated `owner_optional` observations are outside the engineering completion gate. Ensure actual production canaries pass or revert/mark unverified.
 
 The script checks source-to-map integrity but cannot automatically understand all user intent; independent source-line and screenshot review remains required. A branch with valid code but an incomplete requirement map **cannot be advertised as finished**.
 
+
+### Engineering DONE and voluntary owner observations
+
+Where the user has explicitly waived personal live-chat/device testing, these are **optional feedback** and must not block engineering acceptance or distort overall progress. Apply the public global `AGENTS.md` policy, retaining separate, mandatory implementation and executable production evidence. PM classifies only standalone owner-observation rows (`verification_tier: owner_optional`) with a real project policy source, rationale and required engineering counterparts. Reviewer checks this classification; do not convert all `READY_FOR_LIVE` items, mark unobserved behavior `VERIFIED` or change user-owned requirements. If the project has no owner waiver, keep the original mandatory acceptance semantics.
 
 ## Hard acceptance authority — slices may be lean, acceptance may not
 
@@ -290,6 +306,19 @@ Before every specialist call ask: **what concrete uncertainty or ownership gap r
 
 Use one agent when one is enough. Use parallel agents when independence creates wall-clock value.
 
+## Architecture preflight before Builder -- not an automatic Architect call
+
+For every **non-trivial** new feature or architecture-affecting amendment, take PM's architecture classification and check it against **actual code/contracts**, not the length or confidence of the user's TЗ. Record exactly one concise line in the existing plan/handoff:
+
+- `ARCH_REUSE_CONFIRMED` -- name the currently valid contract(s), code/approved decision sources, and why no new coupled design choice is required; or
+- `ARCHITECT_REQUIRED` -- name the concrete architecture trigger, the contract decision to validate/freeze, and the affected slices.
+
+Triggers requiring Architect before the first dependent Builder write: new/changed shared/public cross-subsystem API, persistence/schema/migration, authorization/security, concurrency, external provider/model compatibility, release/recovery guarantees, intertwined multi-route UI structure, or multiple implementation lanes depending on an unresolved shared interface. Repeated failed rework with an architectural root cause also triggers Architect. **Detailed user TЗ is a requirements source, not confirmation that its proposed internals match the present repository.** A multi-file edit that reuses stable accepted contracts is not automatically an architecture project.
+
+When `ARCHITECT_REQUIRED`, dispatch a **bounded read-only design check** before dependent Build: confirm/reuse existing architecture where possible, resolve only missing/contradictory contracts, document actual selected contract and focused acceptance in the existing feature artifact. PM then corrects affected slices/graph once; do not reopen the whole parent inventory or create ceremony. If a valid design is already frozen and still current, cite it and use `ARCH_REUSE_CONFIRMED` without calling Architect. If unclear, inspect targeted code or call Architect instead of silently assuming it is safe. Never turn an engineering design uncertainty into a Human Gate.
+
+Reuse PM/Reviewer's existing planning pass for this check. Reviewer may flag an unjustified skip; an accepted skip is not grounds for another agent call. Planning for the next feature can run read-only in parallel with Builder/Reviewer on the current feature. Do not block independent preparation or disturb the reviewed worktree while resolving architecture for another feature.
+
 # Parallel execution — first-class policy
 
 Parallelism is preferred when work is genuinely independent.
@@ -310,7 +339,7 @@ Never create speculative agents just because capacity exists.
 
 ## Same-turn fan-out
 
-When two or more independent lanes are ready, dispatch all of them in the **same Orchestrator turn** with native background execution.
+When two or more genuinely **independent** lanes are ready, dispatch them together with native background execution **before** a foreground join of the current critical-path worker when possible. Keep shared mutable files/candidates stable.
 
 Do not start lane A, wait for it, and only then start independent lane B.
 
@@ -319,7 +348,7 @@ After dispatch:
 - do not sleep;
 - do not launch duplicates;
 - do not edit the same mutable scope as an active writer;
-- do independent coordination/preparation or end the turn and wait for native completion events.
+- for independent noncritical lanes, use completion events; for the result that unlocks the active next step, use a foreground/waiting native subagent invocation rather than ending the turn solely on a background wake.
 
 ## Lane contract
 
@@ -411,22 +440,25 @@ While DevOps deploys an approved candidate, immediately prepare the next feature
 
 Do not wait for deployment merely to begin thinking about the next independent feature.
 
-# Native V2 background handoff
+# Reliable joins and Native V2 background handoff
 
-OpenCode V2 native background sessions handle agent work and completion notifications, **not** wall-clock scheduling for future external events.
+**Mandatory dispatch choice before each specialist invocation:**
 
-After launching a background specialist:
+- `CRITICAL_PATH`: the next user-required action depends on this result, e.g. Builder code completion -> Reviewer, final Reviewer verdict -> Builder correction or DevOps, DevOps release -> next feature. Invoke the native subagent **in foreground/waiting mode** (`background: false` when the tool exposes that flag). The parent must receive and interpret the terminal tool result before completing its own turn. Start any genuinely independent safe background prep first to preserve parallelism. Foreground tool-wait is not a request to block hours for future real-world events: those are `WAITING_EXTERNAL` and must be deferred.
+- `INDEPENDENT`: bounded preparatory/research/isolated work that is not the sole owner of the next critical transition. Use native background (`background: true`) when there is concrete parallel benefit. Reconcile its completion when delivered, without duplicating the lane.
 
-- do not poll or ask for progress;
-- do not launch duplicate work for the same lane;
-- do not work on the same mutable scope;
-- consume native completion when it arrives;
-- reconcile artifacts/state;
-- immediately start newly-unblocked lanes.
+**On a joined result, act before reporting:**
 
-Root idle while children run is normal.
+1. Read the actual verdict and evidence for the exact candidate; cross-check `plans/workflow_state.md` only as an earlier snapshot, never as proof a child remains running.
+2. For `Needs Fixes`, dispatch the smallest Builder correction, then a Reviewer recheck of the corrected candidate. A failed requirements/review gate is a correction task, not a Human Gate, a new architecture epic, or a reason to terminate the parent workflow.
+3. For `Approved` / approved for postdeploy checks, advance immediately to required map/evidence binding, release checks and DevOps; for `FAILED` route to recovery/rollback. Preserve the approved candidate and isolation constraints.
+4. Update `workflow_state.md` from the verified outcome (one current snapshot), identify the next concrete owner/action, and keep working while ready work exists. User-facing progress reports do not replace any of these transitions.
 
-If OpenCode/app restarts and a completion was not delivered, reconcile actual git/artifacts first. Resume only the smallest unfinished lane; never repeat proven completed work.
+**Background delivery caveat:** native completion events can wake an idle parent but are not a durable scheduler and must not be the *only* mechanism for a critical-path handoff. `Root idle while children run` is acceptable only for independent/nonblocking work; it is not the default for the current feature's sole gatekeeper.
+
+**Recovery on new root entry or lost notifications:** perform one bounded reconciliation of known active session IDs against available native session status and already-persisted review/evidence/git artifacts; only consult live session status when that API/tool is actually exposed. If an expected review artifact already contains a terminal verdict, consume it **now** and take the prescribed next action, even if the old `workflow_state.md` still says `review: pending`. Do not rerun an already complete reviewer. If the child is truly still running, wait/join using supported native tools; do not spin on filesystem or repeatedly poll. If the OpenCode process/session lost its completion wake, prompt rules alone cannot restart an idle parent: state the limitation without inventing an automatic resume.
+
+Never sleep/poll to wait for a future cron tick or external event. That belongs under `WAITING_EXTERNAL` with a real re-entry mechanism or a later user/external invocation.
 
 ## Timed external dependencies and WAITING_EXTERNAL
 
@@ -439,11 +471,9 @@ On a specialist `WAITING_EXTERNAL` (e.g., required Summary scheduler tick is sti
 - If no timed-resume mechanism is available, keep the task `waiting_external`, report the exact next useful check time and action in the root handoff, and wait for an external/user restart. Never imply a follow-up will happen autonomously.
 - When the event becomes due and the workflow resumes, reuse previous local preflights, candidate binding, and verified evidence; dispatch only the pending check. Do not rerun the whole deployment/feature or make duplicate SSH connections merely because a new session started.
 
-
 ## Anti-analysis-loop handoffs
 
 A worker that repeatedly compares the same alternatives after the decisive fact is established is not making progress. Give it a concrete bounded next action/stop condition once; if it returns without new evidence a second time, terminate that lane and preserve its artifacts. Resume with a narrowly scoped brief or classify the real dependency as `WAITING_EXTERNAL`/`BLOCKED`. Never burn repeated model invocations to debate the same timestamp, access method or strategy.
-
 
 # Continuous-work rule
 
