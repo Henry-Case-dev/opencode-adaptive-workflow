@@ -19,7 +19,7 @@ import sys
 
 SCHEMA = "openworkflow-coverage-v1"
 SCOPE_SCHEMA = "openworkflow-progress-scope-v1"
-TASK_STATES = {"PENDING", "BUILDING", "REVIEW", "READY_FOR_LIVE", "WAITING_EXTERNAL", "BLOCKED_REAL_HUMAN_GATE", "FAILED", "VERIFIED"}
+TASK_STATES = {"PENDING", "BUILDING", "REVIEW", "READY_FOR_LIVE", "WAITING_EXTERNAL", "BLOCKED_REAL_HUMAN_GATE", "FAILED", "VERIFIED", "CANCELLED"}
 KNOWN_STATES = {"PENDING", "BUILDING", "REVIEW", "VERIFIED", "FAILED", "BLOCKED_REAL_HUMAN_GATE", "READY_FOR_LIVE"}
 
 
@@ -152,6 +152,45 @@ def _load_scope(scope_path: str, label: str) -> dict:
     if not tasks:
         raise ValueError("реестр задач пуст; проценты не подтверждены")
     task_ids, map_paths, uncovered, stale = set(), [], [], []
+    raw_inputs = root.get("owner_inputs", [])
+    if not isinstance(raw_inputs, list):
+        raise ValueError("owner_inputs должен быть массивом")
+    input_by_id: dict[str, dict] = {}
+    pending_inputs: list[str] = []
+    for row in raw_inputs:
+        if not isinstance(row, dict):
+            raise ValueError("элемент owner_inputs должен быть объектом")
+        iid = str(row.get("id") or "").strip()
+        if not iid or iid in input_by_id:
+            raise ValueError(f"пустой или повторный ID входящего поручения: {iid!r}")
+        input_by_id[iid] = row
+        kind = row.get("kind")
+        if kind not in {"new_task", "amendment", "correction", "cancellation", "decision"}:
+            raise ValueError(f"неизвестный тип входящего поручения {iid}: {kind}")
+        targets = row.get("target_task_ids")
+        if not isinstance(targets, list) or len(set(map(str, targets))) != len(targets) or not all(isinstance(x, str) and x.strip() for x in targets):
+            raise ValueError(f"некорректные связи с задачами у {iid}")
+        if not isinstance(row.get("reconciled"), bool):
+            raise ValueError(f"reconciled должен быть boolean у {iid}")
+        sp, fp = row.get("source_path"), row.get("source_sha256")
+        if not isinstance(sp, str) or not sp.strip() or not isinstance(fp, str) or not re.fullmatch(r"[0-9a-fA-F]{64}", fp):
+            stale.append(f"{iid}: нет проверяемого источника входящего поручения")
+        else:
+            source = Path(sp).resolve()
+            if not source.is_file():
+                stale.append(f"{iid}: потерян исходный текст/снимок ({sp})")
+            elif hashlib.sha256(source.read_bytes()).hexdigest().lower() != fp.lower():
+                stale.append(f"{iid}: исходный текст изменился после регистрации")
+        if not row["reconciled"]:
+            pending_inputs.append(iid)
+    # Detect source snapshots that were written but never registered in the shared index.
+    inbox = path.parent / "owner_inputs"
+    if inbox.is_dir():
+        indexed = {Path(row["source_path"]).resolve() for row in raw_inputs
+                   if isinstance(row.get("source_path"), str) and row["source_path"].strip()}
+        for orphan in sorted(inbox.glob("*.md")):
+            if orphan.resolve() not in indexed:
+                stale.append(f"неучтённое входящее поручение: {orphan}")
     completed_with_maps: list[tuple[str, list[str]]] = []
     map_namespaces: dict[Path, str] = {}
     status_count = Counter()
@@ -179,8 +218,15 @@ def _load_scope(scope_path: str, label: str) -> dict:
         if not isinstance(mp, list) or not all(isinstance(x, str) and x.strip() for x in mp):
             raise ValueError(f"неверный список карт для задачи {tid}")
         # New tasks count immediately; requirements count only after PM maps them.
-        if not row.get("coverage_complete") or not mp:
+        if status != "CANCELLED" and (not row.get("coverage_complete") or not mp):
             uncovered.append(tid)
+        if status == "CANCELLED":
+            cancellation_id = row.get("cancelled_by_input")
+            cancellation = input_by_id.get(cancellation_id)
+            if (not cancellation or cancellation.get("kind") != "cancellation"
+                or not cancellation.get("reconciled") or tid not in cancellation.get("target_task_ids", [])):
+                stale.append(f"{tid}: отмена не подтверждена привязанным решением владельца")
+            continue  # Retain history, exclude deliberately cancelled requirements from active totals.
         if status == "VERIFIED" and mp:
             completed_with_maps.append((tid, mp))
         for raw_map in mp:
@@ -189,6 +235,23 @@ def _load_scope(scope_path: str, label: str) -> dict:
                 raise ValueError(f"одна карта привязана к двум разным поручениям: {raw_map}")
             map_namespaces[resolved] = tid
             map_paths.append(raw_map)
+    for iid, entry in input_by_id.items():
+        targets = entry["target_task_ids"]
+        missing_targets = [tid for tid in targets if tid not in task_ids]
+        if missing_targets and entry["reconciled"]:
+            stale.append(f"{iid}: поручение ссылается на несуществующие задачи: {', '.join(missing_targets)}")
+        if entry["reconciled"] and not targets:
+            # A global policy/decision may have no feature owner, but must point to its recorded outcome.
+            ref = entry.get("recorded_in")
+            if entry["kind"] != "decision" or not isinstance(ref, str) or not ref.strip() or not Path(ref).is_file():
+                stale.append(f"{iid}: закрытое поручение не связано с задачей или документированным решением")
+        if entry["reconciled"] and targets and entry["kind"] != "cancellation":
+            for tid in targets:
+                target = next((t for t in tasks if t.get("id") == tid), None)
+                if target is not None and target.get("status") != "CANCELLED" and (
+                    not target.get("coverage_complete") or not target.get("maps")
+                ):
+                    stale.append(f"{iid}: закрыт учёт входа, но карта требований задачи {tid} неполная")
     for tid, mapped_paths in completed_with_maps:
         if tid in uncovered:
             stale.append(f"{tid}: задача помечена VERIFIED без завершённого учёта требований")
@@ -202,13 +265,19 @@ def _load_scope(scope_path: str, label: str) -> dict:
     # Always distinguish total owner requests from requirements/slices.
     snap = {
         "at_local": _clock(), "scope": label, "scope_file": str(path),
-        "tasks": {"done": status_count["VERIFIED"], "total": len(tasks)},
+        "tasks": {"done": status_count["VERIFIED"], "total": len(tasks) - status_count["CANCELLED"]},
         "task_statuses": dict(sorted(status_count.items())),
+        "owner_inputs": {"registered": len(raw_inputs), "reconciled": len(raw_inputs)-len(pending_inputs),
+                         "pending": pending_inputs},
         "unmapped_tasks": uncovered, "stale_sources": stale,
-        "measurable": not stale,
+        "measurable": not stale and not pending_inputs,
     }
-    if stale:
-        snap["reason"] = "область задач или их подтверждения устарели; сначала сверить исходники, карты и статусы"
+    if pending_inputs:
+        snap["intake_pending"] = pending_inputs
+    if stale or pending_inputs:
+        snap["reason"] = ("есть зарегистрированные, но ещё не согласованные поручения владельца: "
+                          + ", ".join(pending_inputs[:8]) if pending_inputs else
+                          "область задач или их подтверждения устарели; сначала сверить исходники, карты и статусы")
         return snap
     if map_paths:
         snap.update(_load_maps(map_paths, namespaces=map_namespaces))
@@ -256,6 +325,8 @@ def present(snap: dict) -> str:
         lines.append("Прогресс: не рассчитан — " + snap["reason"])
         if snap.get("stale_sources"):
             lines.append("Причины: " + "; ".join(snap["stale_sources"][:5]))
+        if snap.get("intake_pending"):
+            lines.append("Не учтены входящие поручения: " + ", ".join(snap["intake_pending"][:8]))
         return "\n".join(lines)
     if "tasks" in snap:
         task = snap["tasks"]

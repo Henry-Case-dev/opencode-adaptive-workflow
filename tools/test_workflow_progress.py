@@ -221,8 +221,108 @@ class WorkflowProgressTests(unittest.TestCase):
         a = self.write_map("main.json", [("M1", "W1", "VERIFIED")])
         out = io.StringIO()
         with contextlib.redirect_stdout(out):
-            self.assertEqual(progress.main(["--map", a, "--json", "--label", "sample"]), 0)
-        self.assertEqual(json.loads(out.getvalue())["scope"], "sample")
+            self.assertEqual(progress.main(["--map", a, "--json", "--label", "SOUL"]), 0)
+        self.assertEqual(json.loads(out.getvalue())["scope"], "SOUL")
+
+
+    def scope_with_inputs(self, tasks, inputs):
+        file = self.root / "scope-with-inputs.json"
+        file.write_text(json.dumps({"schema": progress.SCOPE_SCHEMA, "tasks": tasks,
+                                    "owner_inputs": inputs}, ensure_ascii=False), encoding="utf-8")
+        return str(file)
+
+    def test_chat_correction_pending_does_not_silently_report_old_percentage(self):
+        m = self.write_map("map.json", [("R1", "S", "VERIFIED")])
+        initial, h = self.source("initial.md", "old task")
+        change, hc = self.source("correction.md", "and please fix aliases")
+        tasks = [{"id":"T", "status":"VERIFIED", "source_path":initial, "source_sha256":h,
+                  "maps":[m], "coverage_complete":True}]
+        inp = [{"id":"in2", "kind":"correction", "source_path":change,
+                "source_sha256":hc, "target_task_ids":["T"], "reconciled":False}]
+        snap = progress.snapshot([], "project", self.scope_with_inputs(tasks, inp))
+        self.assertFalse(snap["measurable"])
+        self.assertEqual(snap["tasks"], {"done":1,"total":1})
+        self.assertIn("in2", progress.present(snap))
+
+    def test_reconciled_short_amendment_does_not_create_second_task(self):
+        m = self.write_map("map.json", [("R1", "S", "VERIFIED"),("R2", "S", "PENDING")])
+        initial, h = self.source("initial.md", "original task")
+        amend, ha = self.source("amend.md", "and check replies")
+        tasks = [{"id":"T", "status":"BUILDING", "source_path":initial, "source_sha256":h,
+                  "maps":[m], "coverage_complete":True}]
+        inp = [{"id":"in2", "kind":"amendment", "source_path":amend,
+                "source_sha256":ha, "target_task_ids":["T"], "reconciled":True}]
+        snap = progress.snapshot([], "project", self.scope_with_inputs(tasks, inp))
+        self.assertTrue(snap["measurable"])
+        self.assertEqual(snap["tasks"]["total"], 1)
+        self.assertEqual(snap["requirements"]["total"], 2)
+
+    def test_unlinked_input_must_be_reconciled_before_progress(self):
+        m = self.write_map("map.json", [("R1", "S", "VERIFIED")])
+        original, h = self.source("original.md", "original")
+        new, hn = self.source("new.md", "new independent project")
+        tasks = [{"id":"T", "status":"VERIFIED", "source_path":original, "source_sha256":h,
+                  "maps":[m], "coverage_complete":True}]
+        inp = [{"id":"incoming", "kind":"new_task", "source_path":new,
+                "source_sha256":hn, "target_task_ids":[], "reconciled":False}]
+        snap = progress.snapshot([], "project", self.scope_with_inputs(tasks, inp))
+        self.assertFalse(snap["measurable"])
+        inp[0]["reconciled"] = True
+        snap = progress.snapshot([], "project", self.scope_with_inputs(tasks, inp))
+        self.assertFalse(snap["measurable"])
+        self.assertIn("не связано с задачей", snap["stale_sources"][0])
+
+    def test_missing_snapshot_and_duplicate_source_ids_are_rejected(self):
+        original, h = self.source("task.md", "task")
+        task = {"id":"T", "status":"PENDING", "source_path":original,
+                "source_sha256":h, "maps":[], "coverage_complete":False}
+        inp = {"id":"x", "kind":"correction", "source_path":str(self.root / "gone.md"),
+               "source_sha256":h,"target_task_ids":["T"], "reconciled":False}
+        snap = progress.snapshot([], "project", self.scope_with_inputs([task],[inp]))
+        self.assertFalse(snap["measurable"])
+        self.assertIn("потерян", snap["stale_sources"][0])
+        with self.assertRaisesRegex(ValueError, "повторный ID входящего"):
+            progress.snapshot([], "project", self.scope_with_inputs([task],[inp,inp]))
+
+    def test_cancelled_task_excluded_from_active_denominator_only_with_owner_source(self):
+        original,h = self.source("task.md", "initial")
+        cancel,hc = self.source("cancel.md", "cancel second task")
+        m = self.write_map("map.json",[("R1","S","VERIFIED")])
+        a = {"id":"A", "status":"VERIFIED", "source_path":original,
+             "source_sha256":h,"maps":[m],"coverage_complete":True}
+        b = {"id":"B", "status":"CANCELLED", "source_path":original,
+             "source_sha256":h,"maps":[],"coverage_complete":False,
+             "cancelled_by_input":"cancel1"}
+        inp = {"id":"cancel1", "kind":"cancellation", "source_path":cancel,
+               "source_sha256":hc,"target_task_ids":["B"],"reconciled":True}
+        snap = progress.snapshot([], "project", self.scope_with_inputs([a,b],[inp]))
+        self.assertTrue(snap["measurable"])
+        self.assertEqual(snap["tasks"], {"done":1,"total":1})
+        b.pop("cancelled_by_input")
+        snap = progress.snapshot([], "project", self.scope_with_inputs([a,b],[inp]))
+        self.assertFalse(snap["measurable"])
+
+    def test_saved_input_without_index_entry_is_detected(self):
+        src, h = self.source("task.md", "initial")
+        self.write_map("map.json", [("R1", "S", "VERIFIED")])
+        inbox = self.root / "owner_inputs"
+        inbox.mkdir()
+        (inbox / "orphan.md").write_text("important correction", encoding="utf-8")
+        scope = self.write_scope([{"id":"T", "status":"PENDING", "source_path":src,
+                                  "source_sha256":h, "maps":[], "coverage_complete":False}])
+        snap = progress.snapshot([], "project", scope)
+        self.assertFalse(snap["measurable"])
+        self.assertIn("неучтённое входящее", snap["stale_sources"][0])
+
+    def test_legacy_scope_without_owner_inputs_remains_supported(self):
+        m = self.write_map("map.json",[("R1","S","VERIFIED")])
+        src,h = self.source("a.md","hello")
+        scope = self.write_scope([{"id":"T","status":"VERIFIED","source_path":src,
+                                  "source_sha256":h,"maps":[m],"coverage_complete":True}])
+        snap = progress.snapshot([],"project",scope)
+        self.assertTrue(snap["measurable"])
+        self.assertEqual(snap["owner_inputs"]["registered"],0)
+
 
 
 if __name__ == "__main__":

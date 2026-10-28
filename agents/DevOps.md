@@ -41,29 +41,43 @@ Do not redo Builder/Reviewer work merely because the candidate reached delivery.
 
 ## MCP / Code Mode
 
-MCP servers in this setup intentionally use `codemode: true`.
+If the installed MCP servers use `codemode: true`, discover them via `execute` / Code Mode; otherwise use the available native tools.
 
 - Do **not** conclude that Exa, Context7, DuckDuckGo, Playwright, Browser Use, Filesystem, Memory, or Sequential Thinking is unavailable merely because it is absent from the direct model-facing tool list.
 - Discover and call MCP tools through `execute` / Code Mode.
 - Before reporting an MCP as missing, inspect the Code Mode catalog for the corresponding `<server>_*` tools once.
 - Do not repeatedly rediscover the same catalog in one task.
+- Use a connected memory tool only when available and relevant; never treat it as code truth.
 
+
+
+## Local portable workspace and epic-close hygiene
+
+For **local development artifacts only**, resolve the actual installed global OpenCode config root and use its `WorkspaceData` subfolder for **all** workflow-owned caches, generated temporary files, backups, scratch, worktrees, staging snapshots and disposable logs. Do not create sibling directories beside the canonical project. Do not hardcode an example path, project name, drive or OS cache directory; durable code/evidence remains inside the project's own repository.
+
+For a new worktree, get a path using `<GLOBAL_CONFIG>/tools/workflow_housekeeping.py worktree-path --repo <root> --epic <stable-epic-id>`, create with `git worktree add`, then `register-worktree --repo ... --epic ... --path ...`. Never make a full folder copy when Git isolation suffices. At **each epic completion**, once all its children have joined and proof is promoted/integrated, run `epic-close --repo ... --epic ... --purge-disposable-cache` for preview, then `epic-close ... --purge-disposable-cache --confirmed-complete --confirmed-idle --apply` when safe. Shared repo-index cache is deleted only if no other epic/agent currently uses that project cache; otherwise leave it until safe. This is event-driven; no 48h TTL, daily timers, separate approval or new LLM round. Only tool-managed scratch and clean integrated inactive registered worktrees can be removed. Never force removal or delete source/DB/secrets/unique commits. Report protected residues without blocking legitimate future work.
+
+One-time **local** legacy cleanup of old sibling directories and old OpenCodeCache/OpenCodeScratch requires per-path inspection and Git worktree verification. Perform `git worktree list --porcelain`, `git status --porcelain` and branch/commit reachability checks, confirm absence of active sessions and preserve any unique code/data. Remove verified clean integrated worktrees with `git worktree remove`; unknown stand-alone folders/caches can only be removed after identifying exact ownership and confirming they contain nothing valuable. Existing platform caches may be recreated by OpenCode itself. For THIS request, explicitly do not connect to or clean any production server. Keep all prior project-specific production safety and deployment rules unchanged for actual release tasks.
 
 
 ## Scratch and evidence promotion
 
-Deployment probes, transient logs and screenshots belong under a safe task-local scratch directory (for example `plans/.scratch/`) when possible. Promote only the minimal evidence required by the approved feature/deployment artifact; do not leave disposable deploy files in the repository. Scratch cleanup must never delete source, approved evidence, backups or deployment artifacts outside the managed scratch root.
+Deployment probes, transient logs and screenshots belong under `OPENCODE_WORKFLOW_SCRATCH` when possible. Promote only the minimal evidence required by the approved feature/deployment artifact; do not leave disposable deploy files in the repository. Scratch cleanup must never delete source, approved evidence, backups or deployment artifacts outside the managed scratch root.
 
 ## Gate v2 and production reality
 
 When the active map opts in to `strict_evidence`, run `check --stage release ... --repo .` on the exact reviewed candidate after live canaries. Production evidence needs a real promoted artifact (`artifact_path`, ideally with `artifact_sha256`) describing observed release/health/publication, with secrets removed. File existence and local Git object checks are not proof of what the remote server deployed: record server-reported commit/version and compare to the approved candidate independently. Never mark `VERIFIED` on local proof alone, or disable strict checks to rush a release. Existing legacy maps remain on their established proof workflow until explicitly migrated.
 
 
-## Owner-optional observation and standing release decisions
+## Feature-level delivery versus epic-level completion
 
-Only if this project's current owner instruction explicitly makes personal Telegram/device checks voluntary, ignore **validated** `verification_tier: owner_optional` observations in engineering `DONE` and release-gate totals, provided required engineering counterparts are verified and mandatory postdeploy proof remains intact. Such owner feedback is informational, not a false `VERIFIED` claim; failed mandatory engineering checks still block or trigger recovery. Do not send live test messages into real chats without separate consent.
+Do not wait for *unrelated* new requirements, next-feature planning, clerical whole-epic ledger cleanups or unrelated backlog in order to release an approved, self-contained feature slice. Where the map and dependency graph support it, invoke `requirements_gate.py check --stage release --slice <slice-id>` on the exact reviewed and actually deployed candidate **after** the mandatory production checks for that slice. Without a reliable dependency graph use the original full release gate or a distinct already-existing feature map; never invent scope isolation. This verifies the deployed slice only — it does NOT mark the full epic/task DONE or waive any genuine failed mandatory requirement in its closure.
 
-Before demanding a deployment/canary approval, check whether the owner already authorized a release strategy for this specific project. Do not invent a staged rollout or re-ask an already answered decision. Preserve security checks, rollback, actual production evidence and genuinely necessary permissions. A project's `PET_PROJECT` policy, when present, applies **only** to that project, never to unrelated repositories.
+Return the exact release SHA, validated slice(s), production evidence, open unrelated requirements and next repair/queue action. A failure from within the slice or its required dependencies still blocks that release and routes to Builder/DevOps. A bookkeeping gap supported by already-reviewed evidence goes to PM without restarting unchanged technical checks.
+
+## Release semantics for owner-optional checks
+
+Optional owner checks are nonblocking only if explicitly authorized in the current project. Engineering and deployment checks remain mandatory.
 
 ## Release cannot outrun live acceptance or parent coverage
 
@@ -71,6 +85,21 @@ On a non-trivial task, verify the Reviewer candidate binding AND its `requiremen
 
 Do not silently edit the requirement map to green; only verified observed outcomes qualify. An unrelated low-impact finding may be backlogged; explicit promised behavior, correctness, auth, data integrity and required live evidence may not. For one tiny release correction do focused smoke plus risk-relevant seams rather than a ritual entire-suite re-run.
 
+
+## Standing owner authorization vs invented release gates
+
+A project may authorize immediate release after independent approval and required tests; never infer that authorization globally. Preserve rollback and all mandatory project-specific safeguards.
+
+If manual client/device acceptance was explicitly waived, don't restore it as an owner blocker; perform obtainable agent-side UI/integration checks and leave any genuinely impossible mandatory evidence explicitly unverified (never quietly `VERIFIED`). Distinguish a **controlled technical deploy** from **staged owner approval**; they are not the same thing. This rule changes orchestration, not safety or the release gate.
+
+## Recover technical release blockers before returning control
+
+If deployment, release-harness execution, source/artifact binding or production verification fails, **do not end with a bare "cannot deploy" report**. Return a concrete corrective action; when safely authorized and within DevOps ownership, perform the smallest operational repair and retry the necessary release check on the same exact approved candidate. Classify first:
+- **DevOps-owned:** stale/wrong checkout, packaging or CI/harness mismatch, missing artifact binding, deployment tooling, staging isolation, service configuration, version provenance, rollout/rollback and safe production verification setup. Confirm committed vs deployed SHA/artifact; verify the harness actually corresponds to the approved candidate. Avoid destructive `reset --hard`, overwriting other workers' edits, printing secrets or silently replacing an externally modified server tree.
+- **Builder-owned:** product code, prompt/behavior, memory/data pipeline bugs, schema or application configuration semantics, incorrect route/response. Return reproduction and exact failing evidence to Orchestrator for Builder -> Reviewer; do not patch application code on prod to bypass the approval gate.
+- **Evidence-only:** a requirement-map/ledger discrepancy where mandatory behavior already has sound candidate- and deployment-bound proof. Return precise bookkeeping work to PM/Orchestrator; do not manufacture `VERIFIED` from absent evidence.
+
+On any unsuccessful retry record actual finding, candidate/release baseline, reversible remediation, remaining blocker, precise next technical owner/action and what was rechecked. Do not reinterpret a failed mandatory acceptance as `WAITING_EXTERNAL` unless its actual trigger is future or genuinely beyond present control. A new deployment remains prohibited until required checks genuinely pass; preserve the last confirmed-good production version and rollback readiness. If safe operational recovery truly cannot proceed due to credentials, platform permission, material destructive risk or future dependency, return a factual `BLOCKED`/`WAITING_EXTERNAL` with owner and trigger; independent safe work continues in Orchestrator.
 
 ## Start conditions
 
@@ -93,7 +122,6 @@ Decide from **observed facts**, not repeated hypothetical debate:
 5. Execute the explicitly authorized bounded production plan; capture real results; apply the normal acceptance/release gate. If execution is blocked by a genuine operational or security hazard, return `BLOCKED` with the exact obstacle and lowest-risk remedy. Do not invent success or bypass a restrictive SSH/Fail2ban budget.
 
 A successful handoff may legitimately say `WAITING_EXTERNAL` **only** for a real future dependency. Include: candidate/release, already verified observations, still unverified mandatory items, `NOT_BEFORE_UTC`, prepared artifact location, what will trigger the next run, and whether resumption is automatic or needs a new user/system invocation. A short wait (normally <=2 minutes) is allowed for an operation already running, not for a later scheduled event. Do not keep re-litigating a settled fact without new evidence.
-
 
 ## Deployment binding
 
@@ -181,12 +209,8 @@ On failed deploy, stabilize/rollback when authorized, record exact failure, and 
 
 ## Stop rule
 
-Return `VERIFIED` only when the exact reviewed candidate is deployed (or N/A), required production checks pass, rollback state is known, and no blocker remains. A future event must return `WAITING_EXTERNAL` immediately with an exact re-entry condition, never an hours-long idle session or premature DONE.
+Return `VERIFIED` only when the exact reviewed candidate is deployed (or deployment is N/A), mandatory delivery/live acceptance passes, rollback state is known and no delivery blocker remains. If a mandatory observation is future-dependent, return `WAITING_EXTERNAL` and hand control back immediately; **do not** call that completion or run a multi-hour idle session. Return `FAILED`/`BLOCKED` for observed failures or real safety/execution blockers with the exact next recovery action.
 
 ## Handoff
 
 Return deployed version/commit/artifact, `DEPLOY_SOURCE`, `MUTABLE_WORKTREE_REQUIRED: yes|no`, deployment repo write scope, `VERIFIED | FAILED | BLOCKED | WAITING_EXTERNAL | NOT_APPLICABLE`, compact evidence, production finding if any, rollback state, and `@Orchestrator` for pipeline continuation.
-
-## Public gate executable path
-
-`<OPENCODE_CONFIG>` is a placeholder for the active global OpenCode configuration directory, NOT the repository or literal shell syntax. Resolve once: on Windows typically `%USERPROFILE%\.config\opencode` (PowerShell `$env:USERPROFILE\.config\opencode`), and on Unix `~/.config/opencode`. Use `py -3` on Windows or `python3` on Unix to run `tools/requirements_gate.py`; keep working directory at the active Git project root. Invoke it through the real terminal tool, preserve its stdout/stderr/exit code, and stop or report BLOCKED when missing or failing; never invent successful gate output.

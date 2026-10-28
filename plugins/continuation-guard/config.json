@@ -1,0 +1,11 @@
+{
+  "enabled": false,
+  "agent": "Orchestrator",
+  "pollMs": 20000,
+  "minIdleMs": 60000,
+  "cooldownMs": 90000,
+  "maxAttemptsWithoutProgress": 2,
+  "maxIdleAgeHours": 8,
+  "sessionLeaseHours": 36,
+  "dryRun": false
+}

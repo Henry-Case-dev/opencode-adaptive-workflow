@@ -47,6 +47,60 @@ class GateTests(unittest.TestCase):
         self.run_gate("check", "--map", str(self.map), "--stage", "review", "--slice", "A", "--candidate", "a"*40, expected=0)
         self.run_gate("check", "--map", str(self.map), "--stage", "release", "--candidate", "a"*40, "--deployed-commit", "a"*40, expected=0)
 
+    def _configure_incremental_slices(self):
+        self.configure()
+        self.assertGreaterEqual(len(self.data["items"]), 2)
+        # A is a reviewed/releasable feature; B is unrelated new work.
+        self.data["items"][-1]["slice"] = "B"
+        self.data["items"][-1]["status"] = "PENDING"
+        self.data["items"][-1]["evidence"] = []
+        self.graph = self.path / "slice-graph.json"
+        self.graph_data = {
+            "schema": "openworkflow-slices-v1",
+            "slices": [
+                {"id": "A", "depends_on": [], "write_scope": ["a/**"],
+                 "acceptance": "A independently works as specified"},
+                {"id": "B", "depends_on": [], "write_scope": ["b/**"],
+                 "acceptance": "B independently works as specified"},
+            ],
+        }
+        self.data["slice_graph_path"] = "slice-graph.json"
+        self.graph.write_text(json.dumps(self.graph_data), encoding="utf8")
+        self.save()
+
+    def test_scoped_release_does_not_wait_for_unrelated_open_slice(self):
+        self._configure_incremental_slices()
+        self.run_gate("check", "--map", str(self.map), "--stage", "release",
+                      "--candidate", "a"*40, "--deployed-commit", "a"*40, expected=1)
+        self.run_gate("check", "--map", str(self.map), "--stage", "release",
+                      "--slice", "A", "--candidate", "a"*40,
+                      "--deployed-commit", "a"*40, expected=0)
+        self.run_gate("check", "--map", str(self.map), "--stage", "release",
+                      "--slice", "B", "--candidate", "a"*40,
+                      "--deployed-commit", "a"*40, expected=1)
+
+    def test_scoped_release_requires_verified_dependency_and_graph(self):
+        self._configure_incremental_slices()
+        self.graph_data["slices"][0]["depends_on"] = ["B"]
+        self.graph.write_text(json.dumps(self.graph_data), encoding="utf8")
+        self.run_gate("check", "--map", str(self.map), "--stage", "release",
+                      "--slice", "A", "--candidate", "a"*40,
+                      "--deployed-commit", "a"*40, expected=1)
+        self.data["items"][-1]["status"] = "VERIFIED"
+        self.data["items"][-1]["evidence"] = [{
+            "type": "integration", "ref": "historical/integration-result",
+            "observation": "previously verified predecessor", "candidate_commit": "b"*40
+        }]
+        self.save()
+        self.run_gate("check", "--map", str(self.map), "--stage", "release",
+                      "--slice", "A", "--candidate", "a"*40,
+                      "--deployed-commit", "a"*40, expected=0)
+        self.data["slice_graph_path"] = ""
+        self.save()
+        self.run_gate("check", "--map", str(self.map), "--stage", "release",
+                      "--slice", "A", "--candidate", "a"*40,
+                      "--deployed-commit", "a"*40, expected=1)
+
     def test_source_hash_drift_blocks(self):
         self.configure()
         self.source.write_text(self.source.read_text(encoding="utf8") + "- Another requirement\n", encoding="utf8")

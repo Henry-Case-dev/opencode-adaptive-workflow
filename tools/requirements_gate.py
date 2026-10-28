@@ -9,6 +9,7 @@ Usage:
   python <OPENCODE_CONFIG>/tools/requirements_gate.py check --map plans/features/X/requirements-map.json --stage plan
   python <OPENCODE_CONFIG>/tools/requirements_gate.py check --map plans/features/X/requirements-map.json --stage review --slice F1 --candidate <sha>
   python <OPENCODE_CONFIG>/tools/requirements_gate.py check --map plans/features/X/requirements-map.json --stage release --candidate <sha> --deployed-commit <sha>
+  python <OPENCODE_CONFIG>/tools/requirements_gate.py check --map plans/features/X/requirements-map.json --stage release --slice F1 --candidate <sha> --deployed-commit <sha>  # only with validated graph/dependencies; NOT parent DONE
 
 Optional per-map flags: `strict_evidence: true` requires real local Git objects and candidate-bound
 repo artifact paths. `slice_graph_path: "slice-graph.json"` enables static dependency/write-scope
@@ -213,7 +214,9 @@ def check(args) -> int:
                 errors.append(f"{rid}: duplicate req_id with inconsistent owner/acceptance/status")
         elif rid:
             reqids[rid] = row
-        if args.stage == "release" or (args.stage == "review" and row.get("slice") == args.slice):
+        if (args.stage == "release" and (not args.slice or row.get("slice") == args.slice)) or (
+            args.stage == "review" and row.get("slice") == args.slice
+        ):
             scoped_required.append(row)
     # Fail closed: old rows remain mandatory. New owner-optional classifications
     # require an auditable user policy and at least one separately verified engineering obligation.
@@ -227,9 +230,58 @@ def check(args) -> int:
             gp = p.parent / gp
         validate_graph(str(gp), owners, errors)
     if args.stage == "review" and not args.slice:
-        errors.append("review stage requires --slice; release must check ALL slices")
-    if args.stage == "review" and not scoped_required:
-        errors.append(f"review scope has no requirements: {args.slice}")
+        errors.append("review stage requires --slice")
+    if args.stage in {"review", "release"} and args.slice and not scoped_required:
+        errors.append(f"{args.stage} scope has no requirements: {args.slice}")
+    if args.stage == "release" and args.slice:
+        # Explicit incremental release. Keep full source/map/graph validation above.
+        # A slice may ship independently only if its dependency closure has valid,
+        # previously VERIFIED evidence. The full-epic release remains the default.
+        if not graph_ref:
+            errors.append("scoped release requires an explicit slice dependency graph")
+        else:
+            try:
+                graph_data = json.loads(Path(gp).read_text(encoding="utf-8"))
+                nodes = {node["id"]: node for node in graph_data["slices"]
+                         if isinstance(node, dict) and isinstance(node.get("id"), str)}
+                if args.slice not in nodes:
+                    errors.append(f"scoped release slice missing from graph: {args.slice}")
+                else:
+                    dependent = set()
+                    visiting = set()
+                    def visit_release_dependencies(ident):
+                        if ident in visiting:
+                            return  # cycle detected by validate_graph
+                        visiting.add(ident)
+                        for dep in nodes.get(ident, {}).get("depends_on", []):
+                            if dep in nodes and dep not in dependent:
+                                dependent.add(dep)
+                                visit_release_dependencies(dep)
+                        visiting.remove(ident)
+                    visit_release_dependencies(args.slice)
+                    if args.slice in dependent:
+                        errors.append("scoped release dependency cycle")
+                    for dep in sorted(dependent - {args.slice}):
+                        dep_rows = [r for r in listed + manual
+                                    if r.get("disposition") == "required"
+                                    and r.get("slice") == dep
+                                    and not optional_owner_check(r)]
+                        if not dep_rows:
+                            errors.append(f"scoped release dependency {dep}: no mandatory rows")
+                        for dep_row in dep_rows:
+                            rid = dep_row.get("req_id", dep_row.get("source_id", "?"))
+                            dep_evidence = dep_row.get("evidence", [])
+                            has_proof = isinstance(dep_evidence, list) and any(
+                                isinstance(ev, dict)
+                                and str(ev.get("ref", "")).strip()
+                                and str(ev.get("observation", "")).strip()
+                                and str(ev.get("candidate_commit", "")).strip()
+                                for ev in dep_evidence
+                            )
+                            if dep_row.get("status") != "VERIFIED" or not has_proof:
+                                errors.append(f"{rid}: required dependency {dep} is not evidenced VERIFIED")
+            except (OSError, ValueError, KeyError, TypeError) as exc:
+                errors.append(f"scoped release graph cannot be verified: {exc}")
     if args.stage in {"review", "release"}:
         expected = data.get("candidate_commit")
         if not args.candidate or not expected or args.candidate != expected:
@@ -442,7 +494,7 @@ def main() -> int:
     c = sub.add_parser("check")
     c.add_argument("--map", required=True)
     c.add_argument("--stage", choices=("plan", "review", "release"), required=True)
-    c.add_argument("--slice")
+    c.add_argument("--slice", help="Review scope; on release, opt in to graph-validated incremental slice delivery (not parent DONE)")
     c.add_argument("--candidate")
     c.add_argument("--deployed-commit")
     c.add_argument("--graph", help="Optional JSON slice dependency/write-scope graph (see doc)")
