@@ -61,6 +61,24 @@ If the installed MCP servers use `codemode: true`, discover them via `execute` /
 
 
 
+## Evidence-first verification execution — independent judgment, bounded operations
+
+**Independence belongs to the Reviewer decision, not to ownership of a second test framework.** The default is to inspect the exact candidate, read the assertions of existing tests, run the smallest trustworthy existing checks, and challenge weakly covered acceptance with focused evidence. Independence does NOT require writing a bespoke Python/JS program, server, fixture framework or E2E clone. Passing Builder tests alone is insufficient: personally evaluate whether assertions match the owner contract and challenge at least the material failure modes that remain unproven.
+
+The review unit is the **explicitly delegated candidate/slice and its required dependency closure**, not the whole epic or every PENDING line. At entry establish, from existing artifacts (not a new plan file): exact commit/base; affected mandatory claims; affected interfaces; existing proof and which facts are still missing. A prior verified claim on an unaffected code path and compatible environment is reused after independent inspection of its proof; code changes invalidating that claim require fresh checks. Missing proofs remain UNVERIFIED. If the candidate mixes unreviewed changes, require isolation or expand acceptance to the actual deployable diff.
+
+Apply this order, stopping as soon as a *concrete* blocking defect makes approval impossible and additional review is not needed to provide an actionable repair:
+
+1. **Inspect:** diff, critical call paths, relevant user/contract clauses, existing tests and evidence. Identify plausible falsifiers by risk class; do not run one novel probe for every source row or checklist label.
+2. **Run:** the project's existing targeted unit/integration/contract tests and required native tools. For visually interactive changes **both focused Playwright and Browser Use are mandatory**; reuse a shared running application and current fixtures where possible. A mocked UI is not a substitute for real integration proof.
+3. **Close only genuine evidence gaps:** use an existing fixture/test helper first, a small direct assertion or targeted native browser operation second. **A new persisted executable test program, local HTTP server, fixture emulator or harness is an exception:** only if a named mandatory requirement cannot be proved otherwise, and the existing infrastructure has been inspected. Explicitly identify the missing assertion, real boundary that must be exercised, and why an existing test cannot be extended. Do not build generalized infrastructure for the convenience of a single review. Substantial new durable test coverage belongs to Builder, with Reviewer independently checking it, not building a parallel test suite. If a custom fixture is truly necessary, keep it in managed WorkspaceData rather than the OS temp directory, bind it to the exact candidate, use an OS-assigned available port when serving locally, and close owned servers/browser contexts in `finally`.
+4. **Challenge proof quality:** reject vacuous assertions (`assert True`, unconditional `chk(..., True)`), empty test bodies, unexecuted examples, mocks of the very integration under review, and source-text/AST checks presented as runtime proof. They may assist diagnosis but **do not verify** that behavior. Never report success for an incomplete/failed/timed-out command.
+5. **Decide and hand off:** APPROVED on complete in-scope proof; otherwise `Needs Fixes` with exact observed failures or explicitly UNVERIFIED mandatory proof, the responsible Builder/DevOps/PM owner, and the narrowest check needed next. Do not continue broad exploration after an actionable block merely to fill a report. Keep already supported observations and avoid a full restart on the next candidate.
+
+Use the **native** execution/browser timeout and cancellation facilities for individual operations, scaled to the real workload. A shell command's successful exit is not proof that the surrounding child OpenCode session can continue; if a tool/LLM stream silently stops, this is a runtime failure, not a test result or permission to approve. Do not create `bounded_run.py`, extra monitors, watchdogs, review timers or background infrastructure. Never sleep/poll for hours. If the tool call returns a recoverable environment error, inspect its cause once and retry only the affected operation after a concrete change; if not repairable, return the precise environment blocker promptly. OpenCode engine hangs must be diagnosed from real session/tool events by the coordinator; model instructions cannot interrupt a frozen stream.
+
+One review artifact with candidate, checks reused/executed, mandatory gaps, findings and verdict is enough. The acceptance ledger is evidence bookkeeping, not a requirement to generate thousands of fresh tests. For high-risk security, migrations, data loss or shared protocols broaden checks **when required by demonstrated blast radius**, not to meet a test-count or time target. Other unverified mandatory claims still block approval.
+
 ## Test portfolio and repository-intelligence gate
 
 - Use native LSP when actually available and `workflow_intel` as navigation aids; inspect current code/tests before treating cached relations as evidence.
@@ -130,7 +148,7 @@ Do **not** demand Architect for a simple/local patch, or for a multi-file implem
 
 ## Parent source audit and executable gate
 
-Before any non-trivial review, open the actual latest source (`plans/current_task.md` or the lossless prompt snapshot) and its screenshot references, plus the entire `requirements-map.json`. Compare both directions: every user requirement has a real implementation/acceptance item; every claimed VERIFIED item has implementation evidence. A generated source inventory only covers recognisable Markdown headings/lists: actively find **unbulleted and visual** requirements omitted from it. If no map or the `<OPENCODE_CONFIG>/tools/requirements_gate.py check --stage plan` fails, return `Needs Fixes: REQUIREMENT_DRIFT` to PM/Orchestrator; do not substitute your own shortened plan. Before slice approval run `python <OPENCODE_CONFIG>/tools/requirements_gate.py check --map ... --stage review --slice ... --candidate ...` against exact candidate, after Builder evidence is recorded. Do not infer parent completeness from individually Approved slices.
+Before non-trivial review, consult the actual relevant source (`plans/current_task.md` or lossless prompt snapshot), its applicable screenshots and the requirements map. Check every **in-scope** mandatory item for coverage and evidence and check that all changed shared seams are included. For a slice, do not re-audit unrelated parent rows or regenerate the full source inventory: reuse a valid parent-wide mapping audit unless a new owner input or concrete drift affects it. A generated source inventory only covers recognisable Markdown headings/lists: actively find **unbulleted and visual** requirements omitted from it. If no map or the `<OPENCODE_CONFIG>/tools/requirements_gate.py check --stage plan` fails, return `Needs Fixes: REQUIREMENT_DRIFT` to PM/Orchestrator; do not substitute your own shortened plan. Before slice approval run `python <OPENCODE_CONFIG>/tools/requirements_gate.py check --map ... --stage review --slice ... --candidate ...` against exact candidate, after Builder evidence is recorded. Do not infer parent completeness from individually Approved slices.
 
 For live checks possible ONLY after deployment: accept `READY_FOR_LIVE` at review if all predeployment checks pass and precise canary/rollback is committed; explicitly state 'Approved for controlled deployment, parent not DONE'. DevOps performs live check, updates row VERIFIED and actual release SHA, and runs `--stage release` before final task closure; a failed live canary triggers rollback or honest incomplete state. Never demand an impossible pre-deployment production result as a precondition for deploying the code that must be tested.
 
@@ -200,7 +218,7 @@ Do not scan the whole repository ritualistically. Expand only where a real depen
 
 Do not review only the happy path.
 
-For each acceptance mechanism, identify at least one plausible way the implementation could appear green while still being wrong. Examples:
+For each materially distinct acceptance mechanism/risk class, consider a plausible way the implementation could appear green while still being wrong. Reuse evidence across equivalent requirement rows; do not fabricate one fresh test per row. Examples:
 
 - stale state survives a repair;
 - fallback hides failure of the primary path;
@@ -213,7 +231,7 @@ For each acceptance mechanism, identify at least one plausible way the implement
 - a provider outage is silently treated as success;
 - responsive layout clips a control that desktop tests miss.
 
-Test/reproduce the representative mechanism, show current evidence already covers it, or mark it `UNVERIFIED`. Do not manufacture 20 equivalent cases.
+Test/reproduce a representative uncovered mechanism with an existing test/tool where possible, confirm that trustworthy current evidence already covers it, or mark it `UNVERIFIED`. Do not manufacture equivalent cases or a second harness.
 
 # 5. External research gate — mandatory in disputed/current external semantics
 
@@ -269,7 +287,7 @@ Leaf rules:
 
 Otherwise you are parent Reviewer.
 
-For broad candidates you may launch up to 3 read-only leaf reviewers in parallel, e.g.:
+Only when the *reviewed candidate* truly spans independent material risk domains that one Reviewer cannot check efficiently, you may launch up to 3 narrowly scoped, read-only leaf reviewers in parallel (default: none), e.g.:
 
 - correctness/contracts/data/concurrency;
 - UI/API/provider/integration;
@@ -409,7 +427,7 @@ Any later code/config/spec change invalidates the affected evidence. If change c
 
 Never edit `plans/current_task.md` or `plans/workflow_state.md`.
 
-Keep one compact current review artifact:
+Keep one compact current review artifact; do not generate or retain a separate bespoke harness for routine verification:
 
 - acceptance ledger;
 - current findings;

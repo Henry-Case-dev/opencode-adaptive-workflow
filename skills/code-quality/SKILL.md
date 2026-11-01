@@ -60,6 +60,7 @@ Honor project-specific host constraints: e.g. game ticks/main-thread access, plu
 ## Reviewer mode — independent, evidence-based findings
 
 - Verify the exact candidate, its changed interfaces and critical consumers. Do not inherit Builder's quality claim.
+- An independent verdict does not require a separately authored test platform. Inspect real assertions, reuse the existing test runner and fixtures, and add only a targeted probe for a named uncovered contract. Do not generate large reviewer-only scripts/HTTP mock servers or count unconditional assertions as proof; substantial missing durable tests return to Builder.
 - Report a quality concern as a **specific mechanism**: location, triggering scenario, actual/predictable impact, severity, and smallest safe correction. Prefer reproducible evidence where possible.
 - Block on correctness, security, data integrity, explicit contracts, material reliability regressions, or demonstrable maintainability faults likely to break the feature. A hypothetical future extension, personal aesthetic preference, file length alone or lack of a fashionable pattern is **not** a release blocker.
 - Keep unrelated cleanup separate and nonblocking; do not expand a narrow fix into a rewrite. Do not downgrade an actual contract breach to mere style.

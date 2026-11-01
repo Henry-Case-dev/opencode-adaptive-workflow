@@ -152,6 +152,12 @@ Mandatory examples:
 
 Do not web-search repository-local facts instead of reading/testing the repo.
 
+## Reviewer-ready handoff — do not force the gate to recreate testing infrastructure
+
+When handing off a candidate, name the exact Git SHA/base and affected mandatory requirement IDs, critical changed seams, existing test runner/fixture locations, exact commands already run, observed failures, and candidate-bound evidence. Point to real integration/visual test entrypoints; identify what the tests *do not* prove instead of claiming full coverage from green counters. This is an ordinary concise handoff, not a new document or gate.
+
+Add durable tests to the **existing project test suite** when new contractual behavior needs them. Reviewer independently inspects assertions and challenges uncovered risks; do not expect Reviewer to develop a parallel project-specific harness. A Reviewer finding should produce a focused bug fix and recheck without repeating unrelated test suites. If an application lacks an adequate harness for a mandatory integration, Builder owns the minimum durable addition, subject to Reviewer scrutiny and normal security/production restrictions.
+
 # Verification
 
 Evidence must answer the acceptance contract, not merely implementation internals.

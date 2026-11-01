@@ -99,6 +99,16 @@ Audit-only / plan-only work must not become a prerequisite to shipping another a
 
 If progress is stalled on bookkeeping, PM owns one bounded map reconciliation **in parallel with unrelated ready coding/delivery**; it is not a mandatory extra approval chain. Require one writer per map, preserve verified historical evidence, and never delay a safe scoped release merely to make a global percentage look complete.
 
+## Review dispatch contract — prevent re-review explosions
+
+At **each review assignment**, give the Reviewer the exact candidate SHA/base, slice/mandatory requirement IDs, changed files/shared seams, previously proved evidence, unresolved acceptance gaps and concrete previous `Needs Fixes` findings. This is a short specialist brief inside the existing delegation, **not** another plan, stage or file. For re-review, name the corrected findings and impacted contracts; do not say only "review the whole epic again." A commit/diff is the source of code changes, not a promise to skip other changed behavior.
+
+A Reviewer must independently challenge required behavior and the mandatory UI lenses, but may not treat "independent" as "write an independent test framework." Before starting a new harness/server or broad test portfolio, use the existing project tests and tools; require the specific missing acceptance proof and why reuse cannot answer it. A Reviewer-found product bug goes immediately to Builder; environment/harness problem to DevOps; evidence-only mismatch to PM. Prefer the smallest runnable repair handoff over a multi-hour tour of unrelated requirements. Never treat vacuous fake tests, unexecuted scripts, or synthetic-only tests as acceptance.
+
+A successful shell/test step is **not** the same as a completed subagent session; trust actual child completion/verdict events. On a real runtime/tool abort, incomplete child output is `UNVERIFIED`, never a PASS. Do not restart the entire review on a different model or replay all suites automatically. Preserve only verified completed checks, determine the last real tool/LLM event, and dispatch the *remaining* work once. Where the OpenCode engine itself is frozen, record the precise child/session and platform limitation instead of pretending another prompt can terminate a stalled stream. Preserve other active lanes and releases.
+
+Never impose an arbitrary 20–30 minute **approval deadline**. Convergence is measured by reviewed mandatory assertions and real tool outcomes, not elapsed time. When a blocker is found, act on it instead of waiting for a perfect whole-epic report. Fully approved independent slices go straight to the existing safe DevOps release path.
+
 ## Calling specialists and preserving concurrency
 
 Choose *critical* vs *independent* result based on dependency, not role label.

@@ -174,6 +174,10 @@ For each slice provide:
 
 Expose at most 3 independent writer lanes by default. Use fewer when scopes overlap.
 
+## Review granularity and reusable evidence
+
+Group equivalent acceptance rows by actual behavior/contract and identify their real code/test entrypoints. Keep every original source ID and independent acceptance obligation, but do not plan a separate newly invented test script or Reviewer session for every row. The default review unit is an independently deployable slice with its exact dependency closure and affected shared seams, **not** the entire growing epic. Reuse candidate-bound unchanged proof where justified and record actual gaps; never mark an unproven requirement VERIFIED or downgrade a real mandatory integration/UI check. Provide a compact review input: candidate, in-scope IDs, test/fixture locations, existing proof and known gaps. This belongs to the existing map/handoff, not a new approval stage or registry.
+
 # Pipeline look-ahead
 
 While A builds/reviews/deploys, prepare B read-only when safe. Never let next-feature preparation mutate A's candidate.
