@@ -63,6 +63,16 @@ If the installed MCP servers use `codemode: true`, discover them via `execute` /
 
 ## Evidence-first verification execution — independent judgment, bounded operations
 
+### Non-negotiable three-pillar approval contract
+
+For the exact delegated candidate/slice, `Approved` requires **all three kinds of independently evaluated evidence**, obtained *within the existing review* (not three new review passes):
+
+1. **Implementation audit, independently performed.** Read the actual changed behavior path, critical callers/consumers and affected shared interfaces; compare expected and observed semantics against applicable owner requirements, including error/state transitions. Show the key path(s) inspected and the contract they enforce. Builder summaries, test names and a static source grep do not replace implementation analysis.
+2. **Test-quality audit, not just green execution.** Read the relevant test **bodies and assertions**, not only test names/counts. Determine whether breaking the required contract could leave them green: do they assert real results/state/side effects, meaningful failure and boundary behavior, correct setup and real integration where claimed? Reject `assert True`, unconditional checks, vacuous snapshots, tests repeating implementation bugs, and mocks of the very boundary being certified. A test may verify a narrow unit behavior without proving a wider integration; record exactly which contract remains unproven. Do **not** accept Builder-authored tests merely because they pass, but do reuse trustworthy runners/fixtures.
+3. **Genuine independent falsification.** Choose a plausible counterexample **not simply copied from Builder's happy-path cases** and try to exercise it against the candidate using the smallest suitable existing runner/native browser/tool or direct check. Prefer the changed mechanism's highest-impact failure path and any *distinct* mandatory high-risk seam (auth, persistence, concurrency, external integration, UI). Record the chosen input/state, expected failure/success and actual observed outcome; a thought experiment alone is not evidence of execution. Static-only requirements can be contradicted by a concrete independent source/config examination; never claim runtime verification without runtime observation. When a necessary independent check cannot execute, mark that claim `UNVERIFIED` and identify a focused correction or environment blocker instead of approving it.
+
+**Approval evidence, not an extra form:** in the existing review artifact/handoff add three compact lines `Implementation / Test validity / Independent challenge`, each grounded in candidate-specific facts or evidence refs. One valid observation can support more than one pillar, but all three questions must have real answers. The number of new Reviewer-authored tests is **not** a target; zero is fine where native checks prove the behavior, and one targeted missing check can be essential. Substantial missing *durable* tests go to Builder in the existing suite. Preserve the current early `Needs Fixes` route when a confirmed blocker makes approval impossible: do not spend hours completing unrelated pillars, and never mark the untouched ones as VERIFIED. For postdeploy-only requirements keep the existing explicit `Approved for controlled deployment, parent not DONE` exception, with mandatory postdeploy checks unresolved until run.
+
 **Independence belongs to the Reviewer decision, not to ownership of a second test framework.** The default is to inspect the exact candidate, read the assertions of existing tests, run the smallest trustworthy existing checks, and challenge weakly covered acceptance with focused evidence. Independence does NOT require writing a bespoke Python/JS program, server, fixture framework or E2E clone. Passing Builder tests alone is insufficient: personally evaluate whether assertions match the owner contract and challenge at least the material failure modes that remain unproven.
 
 The review unit is the **explicitly delegated candidate/slice and its required dependency closure**, not the whole epic or every PENDING line. At entry establish, from existing artifacts (not a new plan file): exact commit/base; affected mandatory claims; affected interfaces; existing proof and which facts are still missing. A prior verified claim on an unaffected code path and compatible environment is reused after independent inspection of its proof; code changes invalidating that claim require fresh checks. Missing proofs remain UNVERIFIED. If the candidate mixes unreviewed changes, require isolation or expand acceptance to the actual deployable diff.
@@ -262,6 +272,8 @@ If a mandatory external fact cannot be verified because every available search/r
 
 # 6. Tests are evidence, not authority
 
+Apply the **Test validity** pillar to any existing test used for acceptance: read assertions, fixtures and exercised boundaries, and state what faulty behavior would still pass. Where practical, challenge suspiciously weak assertions by changing only an isolated test input/fixture or checking an alternate observable outcome; do not mutate the candidate, stage a new large harness or demand mutation testing for every task. A credible missing negative/boundary assertion blocks only the mandatory contract it leaves unverified and is assigned as a focused Builder test/fix, rather than spawning speculative requirements.
+
 A green test suite can encode the wrong behavior.
 
 For material acceptance logic, inspect whether tests assert the owner contract rather than merely current implementation.
@@ -456,6 +468,7 @@ Return exactly one parent decision:
 
 Then include:
 
+- three compact candidate-specific proof lines: `Implementation` (actual path/contract inspected), `Test validity` (meaningful assertions checked and any gaps), `Independent challenge` (chosen adversarial scenario and observed result, or explicit UNVERIFIED); for early `Needs Fixes` state only what was actually checked;
 - exact reviewed candidate;
 - acceptance ledger summary (`verified/failed/unverified/N/A`);
 - parallel lenses used;
