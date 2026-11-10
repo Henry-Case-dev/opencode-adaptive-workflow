@@ -1,0 +1,13 @@
+# Local secrets and generated runtime data
+.env
+.env.*
+!.env.example
+node_modules/
+__pycache__/
+*.py[cod]
+.pytest_cache/
+WorkspaceData/
+OpenCodeScratch/
+OpenCodeCache/
+*.log
+.DS_Store

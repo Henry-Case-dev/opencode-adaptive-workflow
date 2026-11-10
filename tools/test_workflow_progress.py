@@ -221,8 +221,8 @@ class WorkflowProgressTests(unittest.TestCase):
         a = self.write_map("main.json", [("M1", "W1", "VERIFIED")])
         out = io.StringIO()
         with contextlib.redirect_stdout(out):
-            self.assertEqual(progress.main(["--map", a, "--json", "--label", "SOUL"]), 0)
-        self.assertEqual(json.loads(out.getvalue())["scope"], "SOUL")
+            self.assertEqual(progress.main(["--map", a, "--json", "--label", "Sample"]), 0)
+        self.assertEqual(json.loads(out.getvalue())["scope"], "Sample")
 
 
     def scope_with_inputs(self, tasks, inputs):
@@ -251,7 +251,8 @@ class WorkflowProgressTests(unittest.TestCase):
         tasks = [{"id":"T", "status":"BUILDING", "source_path":initial, "source_sha256":h,
                   "maps":[m], "coverage_complete":True}]
         inp = [{"id":"in2", "kind":"amendment", "source_path":amend,
-                "source_sha256":ha, "target_task_ids":["T"], "reconciled":True}]
+                "source_sha256":ha, "target_task_ids":["T"], "reconciled":True,
+                "coverage_refs":[{"task_id":"T", "map":m, "req_ids":["R2"]}]}]
         snap = progress.snapshot([], "project", self.scope_with_inputs(tasks, inp))
         self.assertTrue(snap["measurable"])
         self.assertEqual(snap["tasks"]["total"], 1)
@@ -323,6 +324,163 @@ class WorkflowProgressTests(unittest.TestCase):
         self.assertTrue(snap["measurable"])
         self.assertEqual(snap["owner_inputs"]["registered"],0)
 
+
+
+    def test_current_task_sections_not_in_registry_block_global_percentage(self):
+        folder = self.root / "plans"
+        folder.mkdir()
+        (folder / "current_task.md").write_text("# Epic A\nFix routing\n# Epic B\nFix replies\n", encoding="utf-8")
+        m = self.write_map("map.json", [("R1", "S", "VERIFIED")])
+        src, sha = self.source("task.md", "some earlier plan")
+        scope = folder / "progress_scope.json"
+        scope.write_text(json.dumps({"schema": progress.SCOPE_SCHEMA, "tasks":[{
+            "id": "T", "status": "VERIFIED", "source_path":src,"source_sha256":sha,
+            "maps": [m], "coverage_complete": True
+        }]}), encoding="utf-8")
+        snap = progress.snapshot([], "global", str(scope))
+        self.assertFalse(snap["measurable"])
+        self.assertIn("source_inventory", " ".join(snap["stale_sources"]))
+        template = progress.inventory_template(folder / "current_task.md", self.root)
+        self.assertEqual(len(template["sections"]), 2)
+        self.assertEqual(template["sections"][0]["disposition"], "unreviewed")
+
+    def test_partial_source_inventory_cannot_hide_unmapped_heading(self):
+        folder = self.root / "plans"
+        folder.mkdir()
+        src_file = folder / "current_task.md"
+        src_file.write_text("# A\nDo a\n# B\nDo b\n", encoding="utf-8")
+        m = self.write_map("map.json", [("R1", "S", "PENDING")])
+        initial, sha = self.source("task.md", "initial")
+        t = {"id":"T", "status":"PENDING", "source_path":initial,
+             "source_sha256":sha, "maps":[m],"coverage_complete":True}
+        manifest = progress.inventory_template(src_file, self.root)
+        manifest["sections"] = manifest["sections"][:1]
+        manifest["sections"][0].update(disposition="mapped", target_task_ids=["T"], coverage_refs=[m])
+        scope = folder / "progress_scope.json"
+        scope.write_text(json.dumps({"schema":progress.SCOPE_SCHEMA, "tasks":[t],"source_inventory":manifest}),encoding="utf8")
+        snap = progress.snapshot([], "global", str(scope))
+        self.assertFalse(snap["measurable"])
+        self.assertIn("не учтён раздел current_task", " ".join(snap["stale_sources"]))
+
+    def test_valid_source_inventory_and_input_links_allow_calculation(self):
+        folder = self.root / "plans"
+        folder.mkdir()
+        src_file = folder / "current_task.md"
+        src_file.write_text("# Epic A\nDo a\n# Epic B\nDo b\n", encoding="utf-8")
+        m = self.write_map("map.json", [("R1", "S", "VERIFIED"), ("R2", "S", "PENDING")])
+        src, sha = self.source("task.md", "original")
+        amend, hm = self.source("amend.md", "new details")
+        tasks = [{"id":"T","status":"BUILDING","source_path":src,"source_sha256":sha,
+                  "maps":[m],"coverage_complete":True}]
+        inp = {"id":"in1", "kind":"amendment", "source_path":amend,
+               "source_sha256":hm, "target_task_ids":["T"],"reconciled":True,
+               "coverage_refs":[{"task_id":"T", "map":m,"req_ids":["R2"]}]}
+        manifest = progress.inventory_template(src_file, self.root)
+        for entry in manifest["sections"]:
+            entry.update(disposition="mapped", target_task_ids=["T"], coverage_refs=[m])
+        scope = folder / "progress_scope.json"
+        scope.write_text(json.dumps({"schema":progress.SCOPE_SCHEMA,"tasks":tasks,
+                                     "owner_inputs":[inp],"source_inventory":manifest}), encoding="utf8")
+        snap = progress.snapshot([], "global", str(scope))
+        self.assertTrue(snap["measurable"], snap["stale_sources"])
+        self.assertEqual(snap["source_coverage"]["accounted"], 2)
+        self.assertEqual(snap["requirements"]["total"], 2)
+        self.assertEqual(snap["owner_inputs"]["registered"], 1)
+
+        # A newly appended owner section must reopen scope coverage.
+        src_file.write_text(src_file.read_text(encoding="utf8")+"# Epic C\nDo c\n",encoding="utf8")
+        drift = progress.snapshot([], "global", str(scope))
+        self.assertFalse(drift["measurable"])
+        self.assertTrue(any("Epic C" in item for item in drift["stale_sources"]))
+
+    def test_reconciled_input_with_nonexistent_requirement_is_unverified(self):
+        m = self.write_map("map.json", [("R1", "S", "PENDING")])
+        src,h = self.source("task.md", "original")
+        change,hc = self.source("delta.md", "new feature")
+        tasks=[{"id":"T","status":"PENDING","source_path":src,"source_sha256":h,
+                "maps":[m],"coverage_complete":True}]
+        inp={"id":"delta","kind":"correction","source_path":change,"source_sha256":hc,
+             "target_task_ids":["T"],"reconciled":True,
+             "coverage_refs":[{"task_id":"T","map":m,"req_ids":["NONEXISTENT"]}]}
+        snap=progress.snapshot([],"global",self.scope_with_inputs(tasks,[inp]))
+        self.assertFalse(snap["measurable"])
+        self.assertIn("NONEXISTENT"," ".join(snap["stale_sources"]))
+
+    def test_reconciled_input_without_refs_does_not_pass_anymore(self):
+        m = self.write_map("map.json", [("R1", "S", "VERIFIED")])
+        src,h = self.source("task.md", "original")
+        change,hc = self.source("delta.md", "important correction")
+        tasks=[{"id":"T","status":"VERIFIED","source_path":src,"source_sha256":h,
+                "maps":[m],"coverage_complete":True}]
+        inp={"id":"delta","kind":"correction","source_path":change,"source_sha256":hc,
+             "target_task_ids":["T"],"reconciled":True}
+        snap=progress.snapshot([],"global",self.scope_with_inputs(tasks,[inp]))
+        self.assertFalse(snap["measurable"])
+        self.assertIn("reconciled=true", " ".join(snap["stale_sources"]))
+
+    def test_source_change_requires_reconciliation_even_if_heading_unchanged(self):
+        folder=self.root/"plans"
+        folder.mkdir()
+        source=folder/"current_task.md"
+        source.write_text("# Hello\nBefore\n",encoding="utf8")
+        manifest=progress.inventory_template(source,self.root)
+        source.write_text("# Hello\nAfter\n",encoding="utf8")
+        issues=[]
+        audit=progress.audit_source_inventory({"source_inventory":manifest},folder/"progress_scope.json",{}, {}, issues)
+        self.assertEqual(audit["accounted"],0)
+        self.assertIn("изменён", " ".join(issues))
+
+    def test_ignored_headings_in_code_fences(self):
+        src,_=self.source("headings.md", "# One\n```md\n# Not a task\n```\n# Two\n")
+        depth, sections = progress.source_sections(Path(src))
+        self.assertEqual(depth,1)
+        self.assertEqual(len(sections),2)
+
+    def test_source_inventory_cli_is_read_only(self):
+        folder=self.root/"plans"
+        folder.mkdir()
+        source=folder/"current_task.md"
+        source.write_text("# One\nDo one\n# Two\nDo two\n", encoding="utf8")
+        scope=folder/"progress_scope.json"
+        scope.write_text("{}",encoding="utf8")
+        result=io.StringIO()
+        with contextlib.redirect_stdout(result):
+            self.assertEqual(progress.main(["--scope-file",str(scope),"--inventory-template"]),0)
+        self.assertEqual(json.loads(result.getvalue())["sections"][0]["disposition"],"unreviewed")
+        self.assertEqual(scope.read_text(encoding="utf8"),"{}")
+
+
+class CheckoutLocationIntegrityTests(unittest.TestCase):
+    """A new OpenCode session may have a different process cwd."""
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.tmp.cleanup)
+        self.root = Path(self.tmp.name)
+        self.project = self.root / 'project'
+        (self.project / 'plans/maps').mkdir(parents=True)
+        (self.root / 'other').mkdir()
+        src = self.project / 'plans/task.md'
+        src.write_text('owner requirement', encoding='utf8')
+        m = self.project / 'plans/maps/m.json'
+        m.write_text(json.dumps({'schema':progress.SCHEMA,'items':[{'req_id':'R1',
+            'slice':'W1','status':'PENDING','disposition':'required'}]}),encoding='utf8')
+        self.scope = self.project / 'plans/progress_scope.json'
+        self.scope.write_text(json.dumps({'schema':progress.SCOPE_SCHEMA,'tasks':[{
+            'id':'T1','status':'PENDING','source_path':'plans/task.md',
+            'source_sha256':hashlib.sha256(src.read_bytes()).hexdigest(),
+            'maps':['plans/maps/m.json'],'coverage_complete':True}]}),encoding='utf8')
+
+    def test_relative_sources_and_maps_resolve_at_project_not_cwd(self):
+        import os
+        initial = Path.cwd()
+        try:
+            os.chdir(self.root / 'other')
+            snap = progress.snapshot([], 'all', str(self.scope))
+            self.assertTrue(snap['measurable'], snap['stale_sources'])
+            self.assertTrue(snap['requirements_measurable'])
+            self.assertEqual(snap['requirements']['total'], 1)
+        finally:
+            os.chdir(initial)
 
 
 if __name__ == "__main__":

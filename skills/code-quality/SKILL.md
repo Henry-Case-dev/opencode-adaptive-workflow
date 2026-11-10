@@ -77,3 +77,8 @@ Honor project-specific host constraints: e.g. game ticks/main-thread access, plu
 - New code works only for the happy path and skips the important boundary consumer.
 
 If none of these applies, accept proportionate straightforward code. Good engineering is not maximal complexity or maximal ceremony.
+
+## Per-check disposable evidence hygiene
+
+When an existing test/probe finishes (PASS, FAIL or interruption), first keep the smallest durable candidate-bound proof and exact reproduction needed for subsequent repair/review. Then, if this role created its own disposable run via `workflow_housekeeping.py allocate --unit <stable-id>`, preview and run `run-close --repo ... --epic ... --path ... --confirmed-idle --confirmed-evidence --apply` once the command/browser/server and any consumers are truly finished. At the task/feature handoff, similarly run scoped `unit-close`. Never delete failing evidence still needed to reproduce a problem, active worktrees, user data, shared indexes or another agent's outputs. This is ordinary tool cleanup, not a new independent test phase or new full harness.
+

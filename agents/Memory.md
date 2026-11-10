@@ -166,3 +166,14 @@ Return only:
 ## Stop rule
 
 Stop as soon as the historical fact/conflict is resolved or shown unavailable, or the durable delta is persisted.
+
+## Mandatory hygiene for this role
+
+After each completed investigation/probe/check, retain only the necessary durable references in the receiving task/feature record, then close its independently allocated, idle, positively owned transient run using `tools/workflow_housekeeping.py run-close` (preview then `--confirmed-idle --confirmed-evidence --apply`). At each completed delegated task/feature handoff, do the same with `unit-close --repo <root> --epic <id> --unit <stable-id>` for this role's own allocations. If no transient files were created, say no cleanup required without creating empty scratch directories. Keep uncertain, active, still-consumed or source/evidence-bearing artifacts, record the reason/owner, and let the normal owner close them later. Never clean another role's workspace, shared cache or legacy folders based on names/age; do not create another agent, service, timer or Human Gate for housekeeping.
+
+## Owner is not mandatory QA (workflow-wide, 2026-11-10)
+
+The owner is not the QA and must never receive testing assignments. Verify your own work with available tooling: unit/integration/regression/e2e tests, real API and process checks, production logs and state, application/user-flow scenarios with permitted test environments and accounts, before/after comparison, negative scenarios and side effects, post-deploy metrics, and deferred checks of background jobs and schedules. If something cannot be verified now, use existing telemetry, durable jobs and observation tooling, or record an honest internal status.
+
+Never write "Действие владельца", "За вами" or "осталось проверить вручную" as a task for the owner. Items such as "the owner repeats six test scenarios", "the owner watches production for a day" or "the owner reports if an issue reappears" are not obligations and must not block DONE; reclassify them as verified-by-agent, not-verified-due-to-named-technical-unavailability, background observation, or a genuine owner-only action. Never mark VERIFIED without proof and never delete a real check to raise a percentage. Ask the owner only for a material product/architecture fork, an inaccessible credential/permission, or an irreplaceable action.
+

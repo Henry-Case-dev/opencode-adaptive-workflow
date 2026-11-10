@@ -63,7 +63,9 @@ async function ensureScratch(repo) {
     )
   }
 
-  // No TTL-based cleanup. Owned scratch is retired at verified epic completion.
+  // No TTL-based cleanup. Shared tmp/lanes/pycache may be retired only after
+  // all project consumers are idle via workflow_housekeeping.py shared-scratch-close.
+  // Do not delete reusable repository indexes after each task.
   initializedScratch.add(root)
 
   return { root, tmp, lanes, pycache }

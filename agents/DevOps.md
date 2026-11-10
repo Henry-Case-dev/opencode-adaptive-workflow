@@ -51,18 +51,22 @@ If the installed MCP servers use `codemode: true`, discover them via `execute` /
 
 
 
-## Local portable workspace and epic-close hygiene
+## Local portable workspace and continuous housekeeping
 
 For **local development artifacts only**, resolve the actual installed global OpenCode config root and use its `WorkspaceData` subfolder for **all** workflow-owned caches, generated temporary files, backups, scratch, worktrees, staging snapshots and disposable logs. Do not create sibling directories beside the canonical project. Do not hardcode an example path, project name, drive or OS cache directory; durable code/evidence remains inside the project's own repository.
 
-For a new worktree, get a path using `<GLOBAL_CONFIG>/tools/workflow_housekeeping.py worktree-path --repo <root> --epic <stable-epic-id>`, create with `git worktree add`, then `register-worktree --repo ... --epic ... --path ...`. Never make a full folder copy when Git isolation suffices. At **each epic completion**, once all its children have joined and proof is promoted/integrated, run `epic-close --repo ... --epic ... --purge-disposable-cache` for preview, then `epic-close ... --purge-disposable-cache --confirmed-complete --confirmed-idle --apply` when safe. Shared repo-index cache is deleted only if no other epic/agent currently uses that project cache; otherwise leave it until safe. This is event-driven; no 48h TTL, daily timers, separate approval or new LLM round. Only tool-managed scratch and clean integrated inactive registered worktrees can be removed. Never force removal or delete source/DB/secrets/unique commits. Report protected residues without blocking legitimate future work.
+For a new worktree, get a path using `<GLOBAL_CONFIG>/tools/workflow_housekeeping.py worktree-path --repo <root> --epic <stable-epic-id>`, create with `git worktree add`, then `register-worktree --repo ... --epic ... --path ...`. Never make a full folder copy when Git isolation suffices. As a **residual sweep at epic completion**, once all its children have joined and proof is promoted/integrated, run `epic-close --repo ... --epic ... --purge-disposable-cache` for preview, then `epic-close ... --purge-disposable-cache --confirmed-complete --confirmed-idle --apply` when safe. Shared repo-index cache is deleted only if no other epic/agent currently uses that project cache; otherwise leave it until safe. This is event-driven; no 48h TTL, daily timers, separate approval or new LLM round. Only tool-managed scratch and clean integrated inactive registered worktrees can be removed. Never force removal or delete source/DB/secrets/unique commits. Report protected residues without blocking legitimate future work.
 
 One-time **local** legacy cleanup of old sibling directories and old OpenCodeCache/OpenCodeScratch requires per-path inspection and Git worktree verification. Perform `git worktree list --porcelain`, `git status --porcelain` and branch/commit reachability checks, confirm absence of active sessions and preserve any unique code/data. Remove verified clean integrated worktrees with `git worktree remove`; unknown stand-alone folders/caches can only be removed after identifying exact ownership and confirming they contain nothing valuable. Existing platform caches may be recreated by OpenCode itself. For THIS request, explicitly do not connect to or clean any production server. Keep all prior project-specific production safety and deployment rules unchanged for actual release tasks.
 
 
+## Per-check and per-task DevOps cleanup
+
+After every deployment probe, staging build, smoke test or log inspection, promote the minimal candidate-bound proof first, stop only the subprocesses and viewers owned by the check, then preview `workflow_housekeeping.py run-close --repo <root> --epic <id> --path <marked-run>` and apply with `--confirmed-idle --confirmed-evidence --apply` only if its consumers are actually finished. After the independently completed release task or feature handoff, preview and safely apply `unit-close --repo <root> --epic <id> --unit <task-id>` to the same positively owned artifacts. Leave live, unique, dirty, unmerged, in-use, shared or unknown files untouched and record the exact retained dependency; cleanup must never access an unrelated service, production server, or user's data. The epic close is only a final residual sweep. No new agent, Human Gate, global timer or indiscriminate deletion.
+
 ## Scratch and evidence promotion
 
-Deployment probes, transient logs and screenshots belong under `OPENCODE_WORKFLOW_SCRATCH` when possible. Promote only the minimal evidence required by the approved feature/deployment artifact; do not leave disposable deploy files in the repository. Scratch cleanup must never delete source, approved evidence, backups or deployment artifacts outside the managed scratch root.
+Deployment probes, transient logs and screenshots belong in `WorkspaceData/runs/` with `workflow_housekeeping.py allocate --repo <root> --epic <id> --unit <task-id>`; retain exact marked run paths. Promote only the minimal evidence required by the approved feature/deployment artifact; do not leave disposable deploy files in the repository. Scratch cleanup must never delete source, approved evidence, backups or deployment artifacts outside the managed scratch root.
 
 ## Gate v2 and production reality
 
@@ -214,3 +218,10 @@ Return `VERIFIED` only when the exact reviewed candidate is deployed (or deploym
 ## Handoff
 
 Return deployed version/commit/artifact, `DEPLOY_SOURCE`, `MUTABLE_WORKTREE_REQUIRED: yes|no`, deployment repo write scope, `VERIFIED | FAILED | BLOCKED | WAITING_EXTERNAL | NOT_APPLICABLE`, compact evidence, production finding if any, rollback state, and `@Orchestrator` for pipeline continuation.
+
+## Owner is not mandatory QA (workflow-wide, 2026-11-10)
+
+The owner is not the QA and must never receive testing assignments. Verify your own work with available tooling: unit/integration/regression/e2e tests, real API and process checks, production logs and state, application/user-flow scenarios with permitted test environments and accounts, before/after comparison, negative scenarios and side effects, post-deploy metrics, and deferred checks of background jobs and schedules. If something cannot be verified now, use existing telemetry, durable jobs and observation tooling, or record an honest internal status.
+
+Never write "Действие владельца", "За вами" or "осталось проверить вручную" as a task for the owner. Items such as "the owner repeats six test scenarios", "the owner watches production for a day" or "the owner reports if an issue reappears" are not obligations and must not block DONE; reclassify them as verified-by-agent, not-verified-due-to-named-technical-unavailability, background observation, or a genuine owner-only action. Never mark VERIFIED without proof and never delete a real check to raise a percentage. Ask the owner only for a material product/architecture fork, an inaccessible credential/permission, or an irreplaceable action.
+

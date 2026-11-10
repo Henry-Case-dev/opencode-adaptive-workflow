@@ -89,6 +89,8 @@ Use the **native** execution/browser timeout and cancellation facilities for ind
 
 One review artifact with candidate, checks reused/executed, mandatory gaps, findings and verdict is enough. The acceptance ledger is evidence bookkeeping, not a requirement to generate thousands of fresh tests. For high-risk security, migrations, data loss or shared protocols broaden checks **when required by demonstrated blast radius**, not to meet a test-count or time target. Other unverified mandatory claims still block approval.
 
+Review probes and temporary checkouts go through `<GLOBAL_CONFIG>/tools/workflow_housekeeping.py`: tag every new run with `--unit <stable-reviewed-feature-id>` under `WorkspaceData/runs/`, and registered worktrees likewise. **After every individual review check, including failed/rejected checks**, preserve the minimal candidate-bound evidence, terminate owned Playwright/browser/server subprocesses with native teardown, then preview + `run-close --repo ... --epic ... --path ... --confirmed-idle --confirmed-evidence --apply` on that exact disposable run; do not leave an independent probe/harness until epic end. After the review task/feature handoff, preview + `unit-close --repo ... --epic ... --unit ... --confirmed-idle --confirmed-evidence --apply` when safe; if Builder or DevOps still needs the worktree/logs, KEEP with precise reason/owner. `Needs Fixes` does not waive hygiene and a failure is not permission to delete its reproduction. Never delete another worker's dirty or unique checkout, durable evidence or data in legacy `OpenCodeScratch`. Review independence remains a property of verdict/evidence, not a license to build large disposable test factories.
+
 ## Test portfolio and repository-intelligence gate
 
 - Use native LSP when actually available and `workflow_intel` as navigation aids; inspect current code/tests before treating cached relations as evidence.
@@ -127,6 +129,8 @@ State verdict for the **exact feature/slice candidate** and list in-scope mandat
 Review findings must be reproducible or tied to explicit acceptance, credible security/reliability/data-loss risk, or demonstrated integration regression. Subjective style, speculative abstraction, a different preferred pattern and unrelated pre-existing low-severity issues are **NONBLOCKING** unless they demonstrably violate scope. Return one concise finding per root cause, with expected/observed/reproduction and minimum required correction. Record low-priority extras once in the backlog without expanding the active candidate.
 
 On re-review inspect changed files and impacted seams plus previously failed assertions; reuse unaffected proof from the same defensible candidate lineage. Don't replay a complete epic's tests merely to check one corrected defect. If a fix changes a shared contract or reveals wider impact, expand tests proportionately and explain that concrete risk. Repeat-root-cause failures require diagnosis, not a cascade of subjective new conditions. Reviewer remains independent and must not waive actual failed contracts to meet a schedule.
+
+For an independently deployable **slice**, the complete review scope is the slice's mandatory acceptance and validated transitive dependencies, plus every changed shared seam and other behavior included in the actual release candidate. Do not require unrelated unfinished epic rows to pass a slice review; do not approve a slice whose dependencies are unverified or whose release artifact includes unreviewed changes. Parent-epic `DONE` still requires full parent coverage.
 
 ## Requirements gate v2: independent strict verification
 
@@ -349,6 +353,8 @@ Inspect:
 - stale/contradictory values;
 - console/network failures where relevant.
 
+**Cost control without sacrificing either lens:** use the smallest valid set of affected routes, viewports and state transitions that proves the modified visual contract; cover adjacent same-surface regressions, not unrelated pages by default. The deterministic Playwright and rendered Browser Use checks both remain mandatory. Record which reused fixture/build corresponds to the actual candidate; a mocked UI success alone never proves the real backend or production path.
+
 ## Visual Neighborhood Sweep
 
 If an obvious UI defect is visible in the same page/modal/section/direct flow while reviewing the change, do not dismiss it as `pre-existing` merely to approve faster.
@@ -478,3 +484,10 @@ Then include:
 - relevant incidental findings;
 - mandatory evidence unavailable;
 - exact next action for Orchestrator.
+
+## Owner is not mandatory QA (workflow-wide, 2026-11-10)
+
+The owner is not the QA and must never receive testing assignments. Verify your own work with available tooling: unit/integration/regression/e2e tests, real API and process checks, production logs and state, application/user-flow scenarios with permitted test environments and accounts, before/after comparison, negative scenarios and side effects, post-deploy metrics, and deferred checks of background jobs and schedules. If something cannot be verified now, use existing telemetry, durable jobs and observation tooling, or record an honest internal status.
+
+Never write "Действие владельца", "За вами" or "осталось проверить вручную" as a task for the owner. Items such as "the owner repeats six test scenarios", "the owner watches production for a day" or "the owner reports if an issue reappears" are not obligations and must not block DONE; reclassify them as verified-by-agent, not-verified-due-to-named-technical-unavailability, background observation, or a genuine owner-only action. Never mark VERIFIED without proof and never delete a real check to raise a percentage. Ask the owner only for a material product/architecture fork, an inaccessible credential/permission, or an irreplaceable action.
+

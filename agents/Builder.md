@@ -158,6 +158,16 @@ When handing off a candidate, name the exact Git SHA/base and affected mandatory
 
 Add durable tests to the **existing project test suite** when new contractual behavior needs them. Reviewer independently inspects assertions and challenges uncovered risks; do not expect Reviewer to develop a parallel project-specific harness. A Reviewer finding should produce a focused bug fix and recheck without repeating unrelated test suites. If an application lacks an adequate harness for a mandatory integration, Builder owns the minimum durable addition, subject to Reviewer scrutiny and normal security/production restrictions.
 
+## Bounded implementation and test execution
+
+Do not turn a narrow implementation into an unbounded custom harness or long speculative test series. Identify the relevant existing runner/fixtures before creating a new one; prefer a focused regression reproducing the owner contract, plus impacted integration checks and mandatory UI/live proof. Do **not** drop required tests or reduce coverage to improve speed.
+
+Prefer the existing test runner, browser tooling and their native timeout/cancellation facilities for subprocesses, local servers and probes. Match the timeout to the actual workload; do not add a separate command wrapper, new timer service or universal deadline for an agent. If an operation stalls, inspect its real output and terminate only the owned operation when justified. A timeout or absent output is inconclusive evidence, never `VERIFIED`.
+
+When a command stalls, stop only the process you own, record the last useful output, determine whether it is fixture/port/network/test dependency vs a product fault, and do one focused correction before rerunning. Repeated no-progress on the same cause returns a concrete `Needs Fixes`/infra handoff; don't rebuild a larger harness or hide a failing test. Preserve unaffected passing evidence bound to the same candidate lineage.
+
+**Early deliverable handoff:** when a standalone, contract-complete slice has integrated tests/evidence and a stable exact candidate, return it for Reviewer immediately. Do not hold ready small fixes until other epics, other leaf lanes or optional enhancements finish. A slice is releasable only if its runtime dependencies, shared interfaces and migrations permit independent delivery; do not mislabel a coupled partial implementation as ready. Continue other disjoint work in separate owned scopes while review/release proceeds.
+
 # Verification
 
 Evidence must answer the acceptance contract, not merely implementation internals.
@@ -223,6 +233,12 @@ Never create new sibling `*-wt-*`, `backup-*`, `test-checkout` or cache director
 At each epic completion, after all related tests/review/integration and no remaining worker is using the area, hand off a list of your owned run/worktree paths and their Git status to DevOps. The responsible closeout owner invokes `epic-close` in dry-run followed by `--confirmed-complete --confirmed-idle --apply` only after reviewing output. Do not delete unknown, dirty, untracked, unique-commit, symlinked or shared artifacts; do not reset other writers or destroy retained evidence. Cleanup stays off the critical path of an unfinished epic and is never a pretext for another LLM agent, permission or review.
 
 
+## Workspace ownership and mandatory per-check/task/feature cleanup
+
+Never create new sibling `*-wt-*`, `backup-*`, `test-checkout` or cache directories next to the canonical repository. Resolve global OpenCode config dynamically; all disposable test harnesses, output files, screenshots, staging copies and probes go into `WorkspaceData/runs/` via `tools/workflow_housekeeping.py allocate --repo <root> --epic <id> --unit <task-or-feature-id> --kind probe|temp|artifact`; isolated worktrees use `worktree-path`, `git worktree add` and `register-worktree --unit ...`. Legacy `OpenCodeScratch` is not a write destination. Never copy the whole repo or dependencies as a backup of an ordinary code change; preserve unique diffs as a branch/patch.
+
+**After each individual test/check/probe, even one that fails:** capture useful result and promote candidate-bound evidence outside the disposable path, close owned subprocesses/browsers, then preview + apply `run-close --repo ... --epic ... --path <that-run>` with `--confirmed-idle --confirmed-evidence --apply`. Do this *now*, not when the epic completes; if the result is still referenced by Review/DevOps or another live worker, KEEP and hand off exact ownership/reason. After each delegated task, fix or independently complete feature, preview + apply `unit-close --repo ... --epic ... --unit ...` on safe marked artifacts as part of the existing handoff; never remove a still-needed worktree or unique/dirty changes. For later `Needs Fixes` cycles, safely close previous no-longer-used check outputs once proof is transferred. Existing untagged legacy allocations are handled at safe `epic-close` or individually by `run-close`. Preserve expensive shared indexes and do not purge them while another lane is active. Report removed/retained paths briefly; no extra specialist, plan or approval. Dirty-worktree disposition is still required before its actual final retirement; do not leave indefinite unnamed checkouts. Full conditions are in AGENTS.md.
+
 # Rework
 
 After Reviewer `Needs Fixes`, fix every concrete blocking finding. Do not argue a finding away because tests were green.
@@ -255,3 +271,10 @@ Parent Builder hands off only when:
 # Handoff
 
 Return feature/lane summary, fan-out used, exact candidate fingerprint, files/components changed, acceptance evidence by item, web sources used for external claims, live/UI evidence, remaining real risk, incidental findings, and `@Orchestrator` for strict independent review.
+
+## Owner is not mandatory QA (workflow-wide, 2026-11-10)
+
+The owner is not the QA and must never receive testing assignments. Verify your own work with available tooling: unit/integration/regression/e2e tests, real API and process checks, production logs and state, application/user-flow scenarios with permitted test environments and accounts, before/after comparison, negative scenarios and side effects, post-deploy metrics, and deferred checks of background jobs and schedules. If something cannot be verified now, use existing telemetry, durable jobs and observation tooling, or record an honest internal status.
+
+Never write "Действие владельца", "За вами" or "осталось проверить вручную" as a task for the owner. Items such as "the owner repeats six test scenarios", "the owner watches production for a day" or "the owner reports if an issue reappears" are not obligations and must not block DONE; reclassify them as verified-by-agent, not-verified-due-to-named-technical-unavailability, background observation, or a genuine owner-only action. Never mark VERIFIED without proof and never delete a real check to raise a percentage. Ask the owner only for a material product/architecture fork, an inaccessible credential/permission, or an irreplaceable action.
+

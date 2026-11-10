@@ -72,6 +72,123 @@ class HygieneTests(unittest.TestCase):
         self.cli('epic-close','--repo',self.repo,'--epic','foo','--confirmed-complete','--confirmed-idle','--apply')
         self.assertTrue(folder.exists())
 
+    def test_run_close_after_individual_check_before_epic_end(self):
+        one=Path(self.cli('allocate','--repo',self.repo,'--epic','big','--unit','test-a',
+                          '--kind','probe').stdout.strip())
+        two=Path(self.cli('allocate','--repo',self.repo,'--epic','big','--unit','test-b',
+                          '--kind','probe').stdout.strip())
+        (one/'transient.png').write_text('captured and promoted')
+        (two/'still-running.txt').write_text('active')
+        self.cli('run-close','--repo',self.repo,'--epic','big','--path',one)
+        self.assertTrue(one.exists())  # dry run
+        self.cli('run-close','--repo',self.repo,'--epic','big','--path',one,
+                 '--apply','--confirmed-idle','--confirmed-evidence')
+        self.assertFalse(one.exists())
+        self.assertTrue(two.exists())
+
+    def test_run_close_never_follows_nested_symlinks(self):
+        run=Path(self.cli('allocate','--repo',self.repo,'--epic','safe','--unit','probe',
+                          '--kind','probe').stdout.strip())
+        precious=self.dir/'precious';precious.mkdir()
+        (precious/'user.txt').write_text('unique')
+        try:
+            (run/'unsafe-link').symlink_to(precious, target_is_directory=True)
+        except (OSError, NotImplementedError):
+            self.skipTest('symlink unavailable')
+        result=self.cli('run-close','--repo',self.repo,'--epic','safe','--path',run,
+                        '--apply','--confirmed-idle','--confirmed-evidence')
+        self.assertIn('KEEP',result.stdout)
+        self.assertTrue(run.exists())
+        self.assertTrue((precious/'user.txt').exists())
+
+    def test_run_close_requires_both_safety_attestations(self):
+        one=Path(self.cli('allocate','--repo',self.repo,'--epic','big','--kind','temp').stdout.strip())
+        for args in [(),('--confirmed-idle',),('--confirmed-evidence',)]:
+            r=self.cli('run-close','--repo',self.repo,'--epic','big','--path',one,
+                       '--apply',*args,ok=False)
+            self.assertNotEqual(r.returncode,0)
+            self.assertTrue(one.exists())
+
+    def test_run_close_does_not_touch_foreign_or_symlink_path(self):
+        one=Path(self.cli('allocate','--repo',self.repo,'--epic','a','--kind','temp').stdout.strip())
+        outside=self.dir/'user-owned';outside.mkdir();(outside/'source.txt').write_text('unique')
+        for target in [outside,one]:
+            r=self.cli('run-close','--repo',self.repo,'--epic','wrong','--path',target,
+                       '--apply','--confirmed-idle','--confirmed-evidence')
+            self.assertIn('KEEP',r.stdout)
+        self.assertTrue(one.exists())
+        self.assertTrue((outside/'source.txt').exists())
+
+    def test_unit_close_is_scoped_and_keeps_legacy_untagged(self):
+        a=Path(self.cli('allocate','--repo',self.repo,'--epic','e','--unit','f1','--kind','probe').stdout.strip())
+        b=Path(self.cli('allocate','--repo',self.repo,'--epic','e','--unit','f2','--kind','probe').stdout.strip())
+        legacy=Path(self.cli('allocate','--repo',self.repo,'--epic','e','--kind','probe').stdout.strip())
+        self.cli('unit-close','--repo',self.repo,'--epic','e','--unit','f1',
+                 '--apply','--confirmed-idle','--confirmed-evidence')
+        self.assertFalse(a.exists())
+        self.assertTrue(b.exists())
+        self.assertTrue(legacy.exists())
+
+    def test_unit_close_never_deletes_protected_evidence(self):
+        a=Path(self.cli('allocate','--repo',self.repo,'--epic','e','--unit','f1','--kind','probe').stdout.strip())
+        (a/'review.sqlite').write_text('not disposable')
+        r=self.cli('unit-close','--repo',self.repo,'--epic','e','--unit','f1',
+                   '--apply','--confirmed-idle','--confirmed-evidence')
+        self.assertIn('KEEP',r.stdout)
+        self.assertTrue(a.exists())
+
+    def test_unit_close_retire_only_integrated_worktree_of_unit(self):
+        wt_a=self.setup_worktree('uwork')
+        reg=self.workspace/'registry'/'worktrees'
+        records=list(reg.glob('*.json'))
+        self.assertEqual(len(records),1)
+        data=json.loads(records[0].read_text())
+        data['unit']='feature-a';records[0].write_text(json.dumps(data))
+        self.cli('unit-close','--repo',self.repo,'--epic','uwork','--unit','feature-b',
+                 '--apply','--confirmed-idle','--confirmed-evidence')
+        self.assertTrue(wt_a.exists())
+        self.cli('unit-close','--repo',self.repo,'--epic','uwork','--unit','feature-a',
+                 '--apply','--confirmed-idle','--confirmed-evidence')
+        self.assertFalse(wt_a.exists())
+
+    def test_unit_close_preserves_dirty_worktree(self):
+        wt=self.setup_worktree('dirtyunit')
+        reg=list((self.workspace/'registry'/'worktrees').glob('*.json'))[0]
+        data=json.loads(reg.read_text());data['unit']='f';reg.write_text(json.dumps(data))
+        (wt/'private.patch').write_text('unique changes')
+        r=self.cli('unit-close','--repo',self.repo,'--epic','dirtyunit','--unit','f',
+                   '--apply','--confirmed-idle','--confirmed-evidence')
+        self.assertIn('KEEP worktree',r.stdout)
+        self.assertTrue(wt.exists())
+
+    def test_shared_scratch_close_only_clears_plugin_owned_temp_when_idle(self):
+        import hashlib
+        key = self.repo.name+'-'+hashlib.sha1(str(self.repo.resolve()).encode()).hexdigest()[:12]
+        base = self.workspace/'temp'/'intelligence'/key
+        for k in ('tmp','lanes','pycache'):
+            (base/k).mkdir(parents=True)
+            (base/k/'old.log').write_text('disposable')
+        (base/'.opencode-workflow-scratch.json').write_text(json.dumps({
+            'repo':str(self.repo.resolve()),'managedBy':'opencode-global-intelligence-v3'}))
+        cache=self.workspace/'cache'/'intelligence'/'preserve';cache.mkdir(parents=True)
+        (cache/'repo-intel.sqlite3').write_text('important reuse')
+        r=self.cli('shared-scratch-close','--repo',self.repo,'--apply',ok=False)
+        self.assertNotEqual(r.returncode,0)
+        self.cli('shared-scratch-close','--repo',self.repo,
+                 '--apply','--confirmed-project-idle','--confirmed-evidence')
+        self.assertFalse((base/'tmp').exists())
+        self.assertTrue((base/'.opencode-workflow-scratch.json').exists())
+        self.assertTrue((cache/'repo-intel.sqlite3').exists())
+
+    def test_unowned_shared_scratch_not_deleted(self):
+        import hashlib
+        key = self.repo.name+'-'+hashlib.sha1(str(self.repo.resolve()).encode()).hexdigest()[:12]
+        tmp=self.workspace/'temp'/'intelligence'/key/'tmp';tmp.mkdir(parents=True)
+        (tmp/'unique.txt').write_text('keep')
+        self.cli('shared-scratch-close','--repo',self.repo,'--apply',
+                 '--confirmed-project-idle','--confirmed-evidence')
+        self.assertTrue((tmp/'unique.txt').exists())
+
     def setup_worktree(self,epic):
         wt=Path(self.cli('worktree-path','--repo',self.repo,'--epic',epic).stdout.strip())
         wt.parent.mkdir(parents=True,exist_ok=True)

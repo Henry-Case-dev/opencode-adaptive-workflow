@@ -154,7 +154,7 @@ Put disposable probes/artifacts there. For parallel Builder lanes, prefer:
 
 `$OPENCODE_WORKFLOW_SCRATCH/lanes/<LANE_ID>/`
 
-Promote only required evidence/source before task completion. At a verified epic boundary, the existing workflow owner calls `tools/workflow_housekeeping.py epic-close --repo <root> --epic <stable-epic-id> --purge-disposable-cache` (preview) and adds `--confirmed-complete --confirmed-idle --apply` after inspection. No automatic age-based cleanup. The helper may delete only marker-owned safe scratch and an identified disposable index after the final user of the cache has finished; it never clears arbitrary OS paths or durable proof.
+Promote required evidence/source immediately after each individual check; close the tool-owned disposable run with `run-close` after true tool/browser/process completion and evidence promotion. At every completed task or feature handoff, perform scoped `unit-close` without waiting for the epic. After every project consumer is truly idle, `shared-scratch-close` can remove only known plugin-owned temporary `tmp/lanes/pycache` entries while preserving reusable indexes. `epic-close` remains a final residual sweep with confirmed safe ownership and no consumers. Never use age-based cleanup or clear arbitrary OS paths, active workspaces, shared caches in use, or durable proof. See global AGENTS.md and `tools/workflow_housekeeping.py` for exact commands.
 
 ## 7. Efficiency invariants
 
