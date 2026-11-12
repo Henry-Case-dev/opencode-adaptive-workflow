@@ -93,6 +93,23 @@ class LineageTests(unittest.TestCase):
         self.assertEqual(res["task_conflicts"][0]["fields"], ["status"])
         self.assertEqual(res["task_conflicts"][0]["current_status"], "VERIFIED")
 
+    def test_queue_position_priority_and_blockers_do_not_disappear_between_sessions(self):
+        old_task = dict(self.task("A", "PENDING"), queue_position=5, priority="P0",
+                        blocked_by=["EXAMPLE-ARCH"], blocker_sources={"EXAMPLE-ARCH":"plans/maps/a.json"})
+        self.write_scope(self.repo, dict(self.current_scope, tasks=[old_task]))
+        self.g("add", ".")
+        self.g("commit", "-qm", "queued")
+        queued = self.g("rev-parse", "HEAD").strip()
+        newer = dict(old_task)
+        newer.pop("queue_position")
+        newer["priority"] = "P3"
+        newer["blocked_by"] = []
+        self.write_scope(self.repo, dict(self.current_scope, tasks=[newer]))
+        result = wl.lineage(self.repo, [queued], [])[0]
+        self.assertTrue(result["needs_reconciliation"])
+        self.assertEqual(result["task_conflicts"][0]["fields"],
+                         ["queue_position", "priority", "blocked_by"])
+
     def test_worktree_detected_even_if_branch_not_checked_out(self):
         self.g("branch", "develop", self.old)
         wt = Path(self.tmp.name) / "other"

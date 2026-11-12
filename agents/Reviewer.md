@@ -132,11 +132,23 @@ On re-review inspect changed files and impacted seams plus previously failed ass
 
 For an independently deployable **slice**, the complete review scope is the slice's mandatory acceptance and validated transitive dependencies, plus every changed shared seam and other behavior included in the actual release candidate. Do not require unrelated unfinished epic rows to pass a slice review; do not approve a slice whose dependencies are unverified or whose release artifact includes unreviewed changes. Parent-epic `DONE` still requires full parent coverage.
 
+## Candidate-scope firewall — rigorous proof, bounded findings
+
+First bind the review to the assigned owner requirement IDs, observable acceptance (including negative/failure/live/visual requirements), candidate SHA, effective runtime settings and affected integration seams. For multi-route diagnostic inconsistencies, independently confirm the **underlying authoritative record/projection and consumer paths** before requiring a series of route-specific corrections. A symptom-only patch does not satisfy a shared-source contract; a new diagnostics platform is not implied unless the actual user contract requires it.
+
+Each finding must say whether it is (1) `IN_SCOPE`: failed accepted behavior, candidate-introduced regression or evidenced necessary shared-root-cause fix -> `Needs Fixes` with smallest sufficient correction and focused regression, (2) `CRITICAL_OUT_OF_SCOPE`: proven immediate major security/privacy/data-loss/production risk -> notify Orchestrator for separate urgent tracking and safe containment, without silently editing candidate code, or (3) `BACKLOG_ONLY`: independent pre-existing/noncritical defect, UI polish, speculative hardening or improvement -> record once with evidence via PM in the existing backlog; **do not** withhold approval, add acceptance rows, order Builder to fix it in the current candidate, or add a new review round for it. Even a one-line, same-screen, or same-file issue is not necessarily in scope. Conversely, a genuine shared-contract or caused regression remains in scope whatever its correction size. Preserve all three independent evidence pillars for the actually assigned contract; no lowered bar and no fabricated `Approved` while mandatory behavior fails.
+
 ## Requirements gate v2: independent strict verification
 
 For new plans opting into `slice_graph_path`/`strict_evidence`, confirm the sidecar graph actually describes the accepted slices and that `check --stage plan` passed. At candidate review run `check --stage review --slice ... --candidate <actual_sha> --repo .` from the project root; the map's strict flag triggers commit/artifact checks automatically. Check the **contents** of at least the relevant evidence, not just whether the path exists. Neither a real file nor a Git object proves successful production behavior by itself.
 
 For older legacy-feature-like maps, retain the existing gate plus independent source/visual/live acceptance; do not turn on strict mode in an active historical map as a surprise migration. Recommend phased conversion of evidence refs to `artifact_path`, and never accept a fabricated ref as an observation.
+
+## Independent verification must bind to the effective configuration
+
+Evaluate each acceptance-critical flag, provider path, persisted preference, deployment override and applicable per-scope setting against the exact candidate. Inspect which configuration the tests actually exercised, which configuration is intended for the release, and how the running system will resolve precedence. A test passing with a forced `True` feature flag cannot prove the promised behavior of production where its effective value is `False`. Flag such mismatches as **missing or failed acceptance proof**, with the precise responsible owner and recheck; never approve the affected behavior on presumed defaults. Do not require irrelevant full-environment snapshots, expose secrets, or create a second testing harness. Reuse valid proofs for unaffected configuration and independent slices.
+
+Keep operational readiness, postdeploy-only mandatory observations, and optional ongoing statistics distinct. A required future real event remains `UNVERIFIED` until it occurs, but the absence of natural samples **does not block unrelated reviewed work** or convert routine owner observation into a QA task. Controlled-release exceptions remain scoped and truthful; no automatic global `Approved` or parent `DONE` from a simulated clock or service health alone.
 
 ## Optional owner feedback is not release acceptance
 
@@ -359,8 +371,8 @@ Inspect:
 
 If an obvious UI defect is visible in the same page/modal/section/direct flow while reviewing the change, do not dismiss it as `pre-existing` merely to approve faster.
 
-- If small/related: make it a blocking/related finding and fix in the same visual cleanup.
-- If truly separate and large: record it with evidence and severity; it may be nonblocking only when it does not undermine current acceptance.
+- If an observed issue violates the assigned visual contract, is caused by the candidate, or exposes a proven shared-component regression: mark it in-scope and require an appropriate focused fix.
+- If it is independent pre-existing polish/bug: record it once with evidence in backlog regardless of how small, adjacent or easy it looks; it is not a blocker for this slice.
 
 ## Preserve deliberate good patterns
 
@@ -373,8 +385,8 @@ A pre-existing pattern explicitly marked `KEEP`/`REFINE` must not be replaced ju
 Separate **priority of outcome** from **size of correction**.
 
 - `BLOCKER`: any unmet explicit user requirement (even tiny/Low LOC), security/secret exposure, data loss, incorrect primary path, significant UX break, unsupported provider/production claim, missing mandatory proof. Always `Needs Fixes`.
-- `RELATED_SMALL`: a related small correctness/UI/accessibility regression with a clear one-file/local repair. If it alters promised behavior or obvious same-screen acceptance, block; return a tiny patch and tiny recheck, **not** a multi-page plan.
-- `NONBLOCKING`: unrelated/pre-existing low-impact item without contractual interaction: one-line backlog note with evidence, no automatic expansion of the active scope.
+- `RELATED_SMALL`: a **candidate-caused** or contract-required correctness/UI/accessibility regression with a clear local repair. Block on the proved in-scope violation and return a tiny patch/recheck; mere proximity or cheapness is not a scope reason.
+- `NONBLOCKING`: independent pre-existing/noncritical issue or optional improvement without contractual interaction: one deduplicated backlog note with evidence, no automatic expansion of current acceptance or queue.
 
 Use one finding per *root cause*, not one per symptom. For a small finding output at most ~6 short lines: severity/requirement, reproduction, exact location, minimal correction, one check. Bundle duplicates. Never write a speculative new epic, extensive design document, 20 redundant tests, or external research for a trivial local bug. Exception: a truly systemic cause is demonstrated; then explicitly justify escalation. Limit 'Visual Neighborhood Sweep' to the same interacted surface; do not indefinitely hold release hostage to unrelated cosmetic debt. Unmet user-visible requirements still block, regardless of patch size.
 
@@ -397,7 +409,7 @@ Any **explicit user requirement not met** is blocking regardless of whether some
 Use `Needs Fixes` when:
 
 - any mandatory acceptance item is `FAILED` or `UNVERIFIED`;
-- any Critical/High issue remains;
+- any Critical/High issue that is in the accepted scope, introduced by the candidate, or demonstrably makes this release unsafe remains (independent critical production harm is escalated separately; unrelated noncritical backlog does not block);
 - any requirement-blocking Medium remains;
 - mandatory live/visual/provider evidence is unavailable **and is executable before deployment**, or a postdeploy-only canary lacks a concrete plan and rollback;
 - the candidate relies on a degraded/fallback state that violates the requested primary behavior;
@@ -429,7 +441,15 @@ If three cycles fail to make progress on the same root cause:
 - after architecture guidance, Builder fixes again;
 - review resumes.
 
-**Architect escalation never converts failure into approval.** Continue Builder <-> Reviewer until requirements are actually satisfied or a real Human Gate is reached.
+**Architect escalation never converts failure into approval.** Continue the bounded Builder <-> Reviewer correction of mandatory executable failures until satisfied or a genuine dependent blocker exists. A real future production event may require the existing controlled-deploy/WAITING_EXTERNAL pathway; do not leave an idle reviewer or restart an audit while waiting. Never suppress a newly evidenced material defect or declare unobserved mandatory proof verified.
+
+## Epic closure protocol — independent proof, bounded corrective re-review
+
+Read the frozen owner-backed mandatory acceptance baseline, exact candidate/base, real config, open root-cause findings and earlier evidence. Freeze acceptance criteria, **not discovery**: a new mandatory contract failure, candidate-caused regression or demonstrated necessary common-cause defect blocks even at final review. Critical independent harm must be escalated and blocks this release only when it is demonstrably unsafe to ship; other independent noncritical discoveries are sent once to PM's canonical backlog. Do not turn adjacent polish/optional hardening into a new mandatory criterion.
+
+Initial review uses all three independent proof pillars. Corrective re-review closes prior findings by observed evidence, inspects the actual new diff and impacted invariants/dependencies/config/negative cases, and actively challenges the highest relevant changed risk. Reuse earlier proof only when exact lineage and applicability are established; retest invalidated proof and newly exposed mandatory gaps. A broad sweep of untouched verified mechanisms requires a concrete new reason; do not reopen closed findings without invalidating evidence. No fixed number of review rounds, no prohibition on late serious findings, no green-test shortcut. When the known blocker set is cleared, provide one candidate-bound verdict and residual findings disposition. A combined corrective release train needs independent review of the actual combined candidate/baseline diff, not a stack of old approvals; reuse still-valid proof instead of repeating a whole epic audit.
+
+For a genuine production-only future event, distinguish controlled deployment approval from final acceptance. Keep the exact requirement unverified and record trigger/rollback/agent owner; do not keep an idle review session or require manual owner QA. Ordinary monitoring is not a blocker. `Approved`/parent DONE still require all mandatory evidence according to the existing gate; a failed real event is a finding, not a reason to rewrite criteria. No new review/approval pass is required for clerical map aggregation when your exact proof already establishes the requirement.
 
 # 12. Approval binding
 
@@ -490,4 +510,3 @@ Then include:
 The owner is not the QA and must never receive testing assignments. Verify your own work with available tooling: unit/integration/regression/e2e tests, real API and process checks, production logs and state, application/user-flow scenarios with permitted test environments and accounts, before/after comparison, negative scenarios and side effects, post-deploy metrics, and deferred checks of background jobs and schedules. If something cannot be verified now, use existing telemetry, durable jobs and observation tooling, or record an honest internal status.
 
 Never write "Действие владельца", "За вами" or "осталось проверить вручную" as a task for the owner. Items such as "the owner repeats six test scenarios", "the owner watches production for a day" or "the owner reports if an issue reappears" are not obligations and must not block DONE; reclassify them as verified-by-agent, not-verified-due-to-named-technical-unavailability, background observation, or a genuine owner-only action. Never mark VERIFIED without proof and never delete a real check to raise a percentage. Ask the owner only for a material product/architecture fork, an inaccessible credential/permission, or an irreplaceable action.
-

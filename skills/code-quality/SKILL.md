@@ -68,6 +68,12 @@ Honor project-specific host constraints: e.g. game ticks/main-thread access, plu
 - Keep unrelated cleanup separate and nonblocking; do not expand a narrow fix into a rewrite. Do not downgrade an actual contract breach to mere style.
 - Do not modify application code while reviewing; let the existing Builder → Reviewer correction loop handle fixes.
 
+## Scope-safe root-cause investigation (no new ceremony)
+
+At the existing planning/implementation/review handoff, bind the original requirement IDs and observable result to required interfaces and relevant tests. When a bug spans multiple routes or panels, first trace the current authoritative record/event and common producer/normalizer through persistence/API to affected consumers, with real effective settings. Fix a proved shared cause and test the touched consumers rather than independently patching every symptom. Do not invent a generic central service for an isolated flaw.
+
+An in-scope contract failure, introduced regression or necessary shared-cause fix is mandatory even if it crosses several files; coordinate writer boundaries before widening. An unrelated/pre-existing noncritical defect or enhancement belongs once in the project's existing deduplicated backlog with evidence, not the current implementation or Reviewer gate. Promptly escalate demonstrable active security/data-loss/major production harm for separate safe triage. This rule reduces **scope creep**, not the Reviewer evidence standard.
+
 ## Antipatterns to catch with evidence
 
 - A test is weakened to conceal a defect; a fallback advertises success after failure.
@@ -82,3 +88,6 @@ If none of these applies, accept proportionate straightforward code. Good engine
 
 When an existing test/probe finishes (PASS, FAIL or interruption), first keep the smallest durable candidate-bound proof and exact reproduction needed for subsequent repair/review. Then, if this role created its own disposable run via `workflow_housekeeping.py allocate --unit <stable-id>`, preview and run `run-close --repo ... --epic ... --path ... --confirmed-idle --confirmed-evidence --apply` once the command/browser/server and any consumers are truly finished. At the task/feature handoff, similarly run scoped `unit-close`. Never delete failing evidence still needed to reproduce a problem, active worktrees, user data, shared indexes or another agent's outputs. This is ordinary tool cleanup, not a new independent test phase or new full harness.
 
+## Epic corrective convergence (apply within existing role handoffs)
+
+Use the global mandatory epic closure protocol: freeze the owner-backed observable acceptance before implementation; classify each finding by contract/candidate impact, demonstrated critical harm, or independent backlog. Scope freeze never prevents independent discovery of a new material defect. Keep one deduplicated root-cause finding set in the existing review artifact; re-review fixed findings, changed and impacted invariants, and credible newly exposed mandatory risk. Reuse candidate/config-applicable proof only; preserve independent implementation, test-validity and risk-driven falsification checks. Do not reopen unchanged accepted proof or add a new acceptance criterion for unrelated polish. Batch compatible mandatory corrections into one reviewed integrated release candidate; do not bypass exact-artifact review or mandatory deployment checks. Treat a genuinely future-only mandatory production observation as unverified evidence with a durable trigger, not a reason for idle development or false DONE. No time/review-count quota, new test platform or added approval ceremony.

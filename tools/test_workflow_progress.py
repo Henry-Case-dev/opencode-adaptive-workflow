@@ -221,8 +221,8 @@ class WorkflowProgressTests(unittest.TestCase):
         a = self.write_map("main.json", [("M1", "W1", "VERIFIED")])
         out = io.StringIO()
         with contextlib.redirect_stdout(out):
-            self.assertEqual(progress.main(["--map", a, "--json", "--label", "Sample"]), 0)
-        self.assertEqual(json.loads(out.getvalue())["scope"], "Sample")
+            self.assertEqual(progress.main(["--map", a, "--json", "--label", "Example project"]), 0)
+        self.assertEqual(json.loads(out.getvalue())["scope"], "Example project")
 
 
     def scope_with_inputs(self, tasks, inputs):
@@ -482,6 +482,98 @@ class CheckoutLocationIntegrityTests(unittest.TestCase):
         finally:
             os.chdir(initial)
 
+
+
+
+class TestDurableQueueRegistration(unittest.TestCase):
+    def test_unqueued_task_is_visible_and_strictly_blocks_certification(self):
+        with tempfile.TemporaryDirectory() as directory:
+            scope = Path(directory) / "progress_scope.json"
+            source = Path(directory) / "input.md"
+            source.write_text("queued epic", encoding="utf8")
+            scope.write_text(json.dumps({"schema": progress.SCOPE_SCHEMA,
+                "tasks": [{"id": "EPIC-X", "status": "PENDING",
+                           "source_path": str(source),
+                           "source_sha256": hashlib.sha256(source.read_bytes()).hexdigest(),
+                           "maps": [], "coverage_complete": False}]}), encoding="utf8")
+            snap = progress.snapshot([], "project", str(scope), require_queue=True)
+            self.assertFalse(snap["queue_registration_complete"])
+            self.assertFalse(snap["measurable"])
+            self.assertTrue(any("queue_position" in x for x in snap["execution_queue"]["issues"]))
+            self.assertTrue(any("blocked_by" in x for x in snap["execution_queue"]["issues"]))
+
+    def test_waiting_for_architect_still_has_queue_position(self):
+        scope = [{"id": "EPIC-X", "status": "PENDING", "queue_position": 7,
+                  "priority": "P0", "blocked_by": ["EXAMPLE-ARCH"],
+                  "blocker_sources": {"EXAMPLE-ARCH": "plans/features/epic-x/requirements-map.json"}}]
+        result = progress.audit_execution_queue(scope)
+        self.assertTrue(result["complete"], result["issues"])
+        self.assertEqual(result["entries"][0]["blocked_by"], ["EXAMPLE-ARCH"])
+
+    def test_duplicate_positions_and_dependency_cycle_are_rejected(self):
+        scope = [{"id": "A", "status": "BUILDING", "priority": "P0",
+                  "queue_position": 1, "blocked_by": ["B"]},
+                 {"id": "B", "status": "PENDING", "priority": "P1",
+                  "queue_position": 1, "blocked_by": ["A"]}]
+        result = progress.audit_execution_queue(scope)
+        self.assertFalse(result["complete"])
+        self.assertTrue(any("занят" in x for x in result["issues"]))
+        self.assertTrue(any("цикл" in x for x in result["issues"]))
+
+    def test_finished_and_cancelled_entries_are_not_required_in_active_queue(self):
+        scope = [{"id": "done", "status": "VERIFIED"}, {"id": "cancelled", "status": "CANCELLED"},
+                 {"id": "active", "status": "PENDING", "queue_position": 2,
+                  "priority": "P1", "blocked_by": []}]
+        result = progress.audit_execution_queue(scope)
+        self.assertTrue(result["complete"])
+        self.assertEqual(result["open_tasks"], 1)
+
+    def test_untraced_nontask_blocker_rejected(self):
+        result = progress.audit_execution_queue([{"id": "epic", "status": "PENDING",
+                       "queue_position": 3, "priority": "P0", "blocked_by": ["EXAMPLE-ARCH"]}])
+        self.assertFalse(result["complete"])
+        self.assertTrue(any("blocker_sources" in x for x in result["issues"]))
+
+    def test_bool_position_and_unrecognized_priority_rejected(self):
+        result = progress.audit_execution_queue([{"id": "epic", "status": "PENDING",
+                       "queue_position": True, "priority": "HIGH", "blocked_by": []}])
+        self.assertFalse(result["complete"])
+        self.assertGreaterEqual(len(result["issues"]), 2)
+
+
+class TestQueueSourceEvidence(unittest.TestCase):
+    def test_non_task_blocker_provenance_is_an_actual_file(self):
+        with tempfile.TemporaryDirectory() as d:
+            root = Path(d)
+            row = {"id":"EPIC", "status":"PENDING", "queue_position":1,
+                   "priority":"P0", "blocked_by":["EXAMPLE-ARCH"],
+                   "blocker_sources":{"EXAMPLE-ARCH":"plans/architecture.md"}}
+            result = progress.audit_execution_queue([row], project=root)
+            self.assertFalse(result["complete"])
+            (root / "plans").mkdir()
+            (root / "plans/architecture.md").write_text("Architecture needed",encoding="utf8")
+            result = progress.audit_execution_queue([row], project=root)
+            self.assertTrue(result["complete"])
+
+
+class TestQueueCliGate(unittest.TestCase):
+    def test_missing_queue_returns_nonzero_with_structured_diagnostic(self):
+        with tempfile.TemporaryDirectory() as d:
+            root = Path(d)
+            source = root / "request.md"
+            source.write_text("Task", encoding="utf8")
+            scope = root / "progress_scope.json"
+            scope.write_text(json.dumps({"schema":progress.SCOPE_SCHEMA,"tasks":[{
+                "id":"X","status":"PENDING","source_path":str(source),
+                "source_sha256":hashlib.sha256(source.read_bytes()).hexdigest(),
+                "maps":[],"coverage_complete":False}]}),encoding="utf8")
+            out = io.StringIO()
+            with contextlib.redirect_stdout(out):
+                code = progress.main(["--scope-file",str(scope),"--require-queue","--json"])
+            self.assertEqual(code,3)
+            result = json.loads(out.getvalue())
+            self.assertFalse(result["queue_registration_complete"])
+            self.assertFalse(result["measurable"])
 
 if __name__ == "__main__":
     unittest.main()

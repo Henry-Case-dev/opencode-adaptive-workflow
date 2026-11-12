@@ -23,6 +23,83 @@ TASK_STATES = {"PENDING", "BUILDING", "REVIEW", "READY_FOR_LIVE", "WAITING_EXTER
 KNOWN_STATES = {"PENDING", "BUILDING", "REVIEW", "VERIFIED", "FAILED", "BLOCKED_REAL_HUMAN_GATE", "READY_FOR_LIVE"}
 
 
+def audit_execution_queue(tasks: list[dict], project: Path | None = None) -> dict:
+    """Read-only structural guard for the *existing* tasks[] execution queue.
+
+    Mapping, queue admission and execution are distinct states. Never infer a
+    running worker from BUILDING or an assigned position, and never mutate the
+    owner's queue. Semantic dependency/slice and priority decisions belong to
+    PM/Orchestrator, which have the relevant project sources.
+    """
+    open_rows = [row for row in tasks if isinstance(row, dict) and
+                 str(row.get("status", "")).upper() not in {"VERIFIED", "CANCELLED"}]
+    all_ids = {row.get("id") for row in tasks if isinstance(row, dict)}
+    positions: dict[int, str] = {}
+    issues: list[str] = []
+    entries: list[dict] = []
+    edges: dict[str, list[str]] = {}
+    for row in open_rows:
+        tid = str(row.get("id") or "(no id)")
+        pos, priority, blockers = row.get("queue_position"), row.get("priority"), row.get("blocked_by")
+        if type(pos) is not int or pos <= 0:
+            issues.append(f"{tid}: отсутствует положительный queue_position")
+        elif pos in positions:
+            issues.append(f"{tid}: queue_position={pos} занят задачей {positions[pos]}")
+        else:
+            positions[pos] = tid
+        if not (isinstance(priority, str) and re.fullmatch(r"P[0-9]", priority.upper()) or
+                type(priority) is int and 0 <= priority <= 9):
+            issues.append(f"{tid}: отсутствует/некорректен priority (P0..P9 или 0..9)")
+        if not isinstance(blockers, list) or any(not isinstance(b, str) or not b.strip() for b in blockers):
+            issues.append(f"{tid}: blocked_by должен быть явным списком, включая []")
+            blockers = []
+        if len(set(blockers)) != len(blockers):
+            issues.append(f"{tid}: дублирующиеся blocked_by")
+        if tid in blockers:
+            issues.append(f"{tid}: задача блокирует саму себя")
+        # A non-task dependency (an internal slice, architecture contract or
+        # external event) needs a trace to an existing project artifact. This
+        # does not prove the dependency is necessary: PM reviews that.
+        refs = row.get("blocker_sources", {})
+        if refs is None:
+            refs = {}
+        if not isinstance(refs, dict):
+            issues.append(f"{tid}: blocker_sources должен быть объектом")
+            refs = {}
+        for blocker in blockers:
+            if blocker not in all_ids:
+                ref = refs.get(blocker)
+                if not isinstance(ref, str) or not ref.strip():
+                    issues.append(f"{tid}: для зависимости {blocker} нет blocker_sources")
+                elif project is not None:
+                    source_path = _project_path(ref, project)
+                    if not source_path.is_file():
+                        issues.append(f"{tid}: blocker_sources для {blocker} не найден: {ref}")
+        edges[tid] = [b for b in blockers if b in all_ids and b != tid]
+        entries.append({"task_id": tid, "queue_position": pos, "priority": priority,
+                        "blocked_by": blockers, "status": str(row.get("status", ""))})
+    # Detect cycles between in-scope tasks; a queue position cannot rescue one.
+    visiting: set[str] = set()
+    visited: set[str] = set()
+    def visit(node: str, chain: list[str]) -> None:
+        if node in visiting:
+            issues.append("цикл зависимостей: " + " -> ".join(chain + [node]))
+            return
+        if node in visited:
+            return
+        visiting.add(node)
+        for next_node in edges.get(node, []):
+            if next_node in edges:
+                visit(next_node, chain + [node])
+        visiting.remove(node)
+        visited.add(node)
+    for task_id in edges:
+        visit(task_id, [])
+    entries.sort(key=lambda x: x["queue_position"] if type(x["queue_position"]) is int and x["queue_position"] > 0 else float("inf"))
+    return {"complete": not issues, "open_tasks": len(open_rows),
+            "registered": len(positions), "issues": issues, "entries": entries}
+
+
 def optional_owner_check(row: dict) -> bool:
     return row.get("verification_tier", "engineering") == "owner_optional"
 
@@ -510,6 +587,7 @@ def _load_scope(scope_path: str, label: str) -> dict:
             continue
         if check["requirements"]["done"] == check["requirements"]["total"]:
             status_drift_candidates.append(task["id"])
+    queue_audit = audit_execution_queue(tasks, project=project)
     # Always distinguish total owner requests from requirements/slices.
     snap = {
         "at_local": _clock(), "scope": label, "scope_file": str(path),
@@ -519,6 +597,7 @@ def _load_scope(scope_path: str, label: str) -> dict:
                          "pending": pending_inputs},
         "unmapped_tasks": uncovered, "stale_sources": stale,
         "source_coverage": section_coverage, "status_drift_candidates": status_drift_candidates,
+        "execution_queue": queue_audit, "queue_registration_complete": queue_audit["complete"],
         "measurable": not stale and not pending_inputs,
     }
     if pending_inputs:
@@ -555,9 +634,15 @@ def _stat(done: int, total: int, width: int = 20) -> str:
     return f"{done}/{total} ({pct}%) [{('#' * full) + ('-' * (width - full))}]"
 
 
-def snapshot(paths: list[str], label: str, scope_file: str | None = None) -> dict:
+def snapshot(paths: list[str], label: str, scope_file: str | None = None,
+             require_queue: bool = False) -> dict:
     if scope_file:
-        return _load_scope(scope_file, label)
+        snap = _load_scope(scope_file, label)
+        if require_queue and not snap["queue_registration_complete"]:
+            snap["measurable"] = False
+            queue_reason = "очередь исполнения не завершена: отсутствует позиция, приоритет или проверяемая зависимость"
+            snap["reason"] = snap.get("reason", "") + ("; " if snap.get("reason") else "") + queue_reason
+        return snap
     snap = {"at_local": _clock(), "scope": label}
     if paths:
         snap.update(_load_maps(paths))
@@ -570,6 +655,9 @@ def snapshot(paths: list[str], label: str, scope_file: str | None = None) -> dic
 
 def present(snap: dict) -> str:
     lines = [f"Время среды: {snap['at_local']}", f"Область: {snap['scope']}"]
+    if "execution_queue" in snap and not snap["execution_queue"]["complete"]:
+        lines.append("Очередь исполнения: не подтверждена — " +
+                     "; ".join(snap["execution_queue"]["issues"][:5]))
     if not snap["measurable"]:
         lines.append("Прогресс: не рассчитан — " + snap["reason"])
         if snap.get("stale_sources"):
@@ -611,6 +699,7 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--label", default="активное ТЗ", help="Человекочитаемое название области счёта")
     parser.add_argument("--json", action="store_true", help="Отдать структурированные данные")
     parser.add_argument("--inventory-template", action="store_true", help="Вывести шаблон обратного учёта current_task, не изменяя файлы")
+    parser.add_argument("--require-queue", action="store_true", help="Не подтверждать общий прогресс при незавершённой регистрации в исполняемой очереди")
     parser.add_argument("--source-file", help="Источник для шаблона (по умолчанию plans/current_task.md)")
     parser.add_argument("--compare-ref", action="append", default=[], help="Git ref/SHA проверенного релиза или интеграции (явно выбранный)")
     parser.add_argument("--compare-worktree", action="append", default=[], help="другая активная рабочая копия того же репозитория")
@@ -626,7 +715,9 @@ def main(argv: list[str] | None = None) -> int:
                 raise ValueError(f"нет исходного файла: {source}")
             print(json.dumps(inventory_template(source, project), ensure_ascii=False, indent=2))
             return 0
-        data = snapshot(args.map, args.label, args.scope_file)
+        if args.require_queue and not args.scope_file:
+            raise ValueError("--require-queue требует --scope-file")
+        data = snapshot(args.map, args.label, args.scope_file, require_queue=args.require_queue)
         if args.compare_ref or args.compare_worktree:
             if not args.scope_file:
                 raise ValueError("сверка веток требует --scope-file")
@@ -647,7 +738,9 @@ def main(argv: list[str] | None = None) -> int:
         print("ПРОГРЕСС НЕИЗВЕСТЕН: " + str(exc), file=sys.stderr)
         return 2
     print(json.dumps(data, ensure_ascii=False, indent=2) if args.json else present(data))
-    return 0
+    # Queue admission is an explicit gate when requested, not just a warning in
+    # a wall of JSON. Exit 3 preserves diagnostic output and mutates nothing.
+    return 3 if args.require_queue and not data.get("queue_registration_complete", False) else 0
 
 
 if __name__ == "__main__":

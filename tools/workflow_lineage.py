@@ -150,7 +150,8 @@ def compare(current: Snapshot, reference: Snapshot) -> dict:
     maps_to_compare: set[str] = set()
     for tid in sorted(tasks_a.keys() & tasks_b.keys()):
         x, y = tasks_a[tid], tasks_b[tid]
-        compare_fields = ["status", "coverage_complete", "source_sha256", "cancelled_by_input"]
+        compare_fields = ["status", "coverage_complete", "source_sha256", "cancelled_by_input",
+                          "queue_position", "priority", "blocked_by", "blocker_sources"]
         changed = [f for f in compare_fields if x.get(f) != y.get(f)]
         try:
             xa = sorted(safe_rel(m, current.root) for m in x.get("maps", []))
