@@ -11,6 +11,12 @@ Usage:
   python <OPENCODE_CONFIG>/tools/requirements_gate.py check --map plans/features/X/requirements-map.json --stage release --candidate <sha> --deployed-commit <sha>
   python <OPENCODE_CONFIG>/tools/requirements_gate.py check --map plans/features/X/requirements-map.json --stage release --slice F1 --candidate <sha> --deployed-commit <sha>  # only with validated graph/dependencies; NOT parent DONE
 
+Stages: plan -> review -> deploy (before deployment) -> release (after deployment).
+The optional delivery stage verifies engineering delivery while explicitly required,
+non-blocking future production observations remain open. It is NOT final acceptance.
+REVIEW rows need candidate-bound independent approval and implementation evidence;
+READY_FOR_LIVE remains reserved for postdeploy-only checks. See AGENTS.md.
+
 Optional per-map flags: `strict_evidence: true` requires real local Git objects and candidate-bound
 repo artifact paths. `slice_graph_path: "slice-graph.json"` enables static dependency/write-scope
 checks. These do not prove semantic completeness or live deployment identity by themselves.
@@ -24,6 +30,7 @@ import re
 import sys
 import subprocess
 import fnmatch
+from functools import lru_cache
 from pathlib import Path
 
 INVENTORY_PATTERN = re.compile(r"^\s*(?:#{2,5}\s+|[-*+]\s+|(?:\d+[.)]|[A-Z]\d+[.):])\s+)\S")
@@ -32,6 +39,112 @@ OTHER = {"context", "duplicate", "user_excluded"}
 STATES = {"PENDING", "BUILDING", "REVIEW", "VERIFIED", "FAILED", "BLOCKED_REAL_HUMAN_GATE", "READY_FOR_LIVE"}
 # Absent on legacy rows means the original, mandatory engineering acceptance.
 TIERS = {"engineering", "owner_optional"}
+CANDIDATE_STAGES = {"review", "deploy", "delivery", "release"}
+POSTDEPLOY_STAGES = {"delivery", "release"}
+APPROVALS = {"Approved", "Approved for controlled deployment", "Approved for controlled deployment, parent not DONE"}
+
+
+# Deliberately narrow: no arbitrary path allowlist, no source/map/config changes.
+OFFLINE_PROOF_TYPES = {"review", "unit", "integration", "e2e", "test", "static", "inspection", "contract"}
+
+
+def contract_digest(row: dict) -> str:
+    """Bind the requirement as recorded when the proof was made, not its status."""
+    contract = {k: v for k, v in row.items() if k not in {"status", "evidence"}}
+    return sha(json.dumps(contract, sort_keys=True, ensure_ascii=False, separators=(",", ":")).encode("utf-8"))
+
+
+@lru_cache(maxsize=128)
+def metadata_only_descendant(repo: str, old: str, new: str) -> bool:
+    """Compare immutable commits; reject unknown paths/modes and non-descendants."""
+    if not all(re.fullmatch(r"[0-9a-fA-F]{7,40}", v) for v in (old, new)):
+        return False
+    def git(*args):
+        return subprocess.run(["git", "-C", repo, *args], capture_output=True, timeout=15)
+    try:
+        if git("merge-base", "--is-ancestor", old, new).returncode:
+            return False
+        result = git("diff", "--raw", "-z", "--no-renames", old, new, "--")
+        if result.returncode:
+            return False
+        parts = result.stdout.split(b"\0")
+        if parts[-1:] != [b""]:
+            return False
+        parts.pop()
+        if len(parts) % 2:
+            return False
+        for header, path in zip(parts[::2], parts[1::2]):
+            modes = header.split()[:2]
+            if len(modes) != 2 or modes[0] not in (b":000000", b":100644") or modes[1] not in (b"000000", b"100644"):
+                return False
+            if not re.fullmatch(rb"plans/features/[^/]+/evidence/(?:[^/]+/)*[^/]+\.(?:md|json)", path):
+                return False
+        return True
+    except (OSError, subprocess.TimeoutExpired):
+        return False
+
+
+def bound_evidence(row: dict, candidate: str, repo: Path | None = None) -> list[dict]:
+    ev = row.get("evidence", [])
+    if not isinstance(ev, list):
+        return []
+    out = []
+    for x in ev:
+        if not isinstance(x, dict) or not str(x.get("ref", "")).strip() or not str(x.get("observation", "")).strip():
+            continue
+        old = x.get("candidate_commit")
+        if old == candidate:
+            out.append(x)
+            continue
+        if (repo is None or x.get("reuse_on_metadata") is not True
+                or x.get("type") not in OFFLINE_PROOF_TYPES
+                or x.get("deployed_commit") or not isinstance(old, str)
+                or not isinstance(candidate, str)
+                or x.get("contract_sha256") != contract_digest(row)
+                or not isinstance(x.get("artifact_sha256"), str)):
+            continue
+        issues = []
+        verify_artifact(repo, x, str(row.get("req_id", "?")), issues)
+        if not issues and metadata_only_descendant(str(repo.resolve()), old, candidate):
+            out.append(x)
+    return out
+
+
+def valid_proofs(entries: list[dict], repo: Path, strict: bool, rid: str) -> list[dict]:
+    if not strict:
+        return entries
+    valid = []
+    for entry in entries:
+        issues = []
+        verify_artifact(repo, entry, rid, issues)
+        if not issues:
+            valid.append(entry)
+    return valid
+
+
+def independent_approval(entries: list[dict], repo: Path, rid: str, wait=None) -> bool:
+    # New transition always needs a real review artifact, even on legacy maps.
+    for x in entries:
+        if (x.get("type") != "review" or x.get("verdict") not in APPROVALS
+                or x.get("reviewer_role") != "Reviewer"):
+            continue
+        if wait is not None and x.get("approved_postrelease_wait") != wait:
+            continue
+        issues = []
+        verify_artifact(repo, x, rid, issues)
+        if not issues:
+            return True
+    return False
+
+
+def future_observation(row: dict) -> bool:
+    """Explicit, required, postrelease-only evidence; never an automatic waiver."""
+    wait = row.get("postrelease_wait")
+    return (row.get("live_required") is True and row.get("live_when") == "postdeploy"
+            and isinstance(wait, dict) and wait.get("nonblocking") is True
+            and all(isinstance(wait.get(k), str) and wait[k].strip()
+                    for k in ("reason", "trigger", "next_check", "owner", "contract_ref")))
+
 
 
 def optional_owner_check(row: dict) -> bool:
@@ -210,13 +323,16 @@ def check(args) -> int:
             if (str(prior.get("slice", "")).strip() != owning_slice or
                 str(prior.get("acceptance", "")).strip() != str(row.get("acceptance", "")).strip() or
                 prior.get("status") != row.get("status") or
+                prior.get("live_required") != row.get("live_required") or
+                prior.get("live_when", "preprod") != row.get("live_when", "preprod") or
+                prior.get("postrelease_wait") != row.get("postrelease_wait") or
                 prior.get("verification_tier", "engineering") != row.get("verification_tier", "engineering")):
                 errors.append(f"{rid}: duplicate req_id with inconsistent owner/acceptance/status")
         elif rid:
             reqids[rid] = row
-        if (args.stage == "release" and (not args.slice or row.get("slice") == args.slice)) or (
-            args.stage == "review" and row.get("slice") == args.slice
-        ):
+        if "postrelease_wait" in row and not future_observation(row):
+            errors.append(f"{rid}: invalid postrelease_wait; only explicit postdeploy observations may be deferred")
+        if args.stage in CANDIDATE_STAGES and (not args.slice or row.get("slice") == args.slice):
             scoped_required.append(row)
     # Fail closed: old rows remain mandatory. New owner-optional classifications
     # require an auditable user policy and at least one separately verified engineering obligation.
@@ -231,9 +347,9 @@ def check(args) -> int:
         validate_graph(str(gp), owners, errors)
     if args.stage == "review" and not args.slice:
         errors.append("review stage requires --slice")
-    if args.stage in {"review", "release"} and args.slice and not scoped_required:
+    if args.stage in CANDIDATE_STAGES and not scoped_required:
         errors.append(f"{args.stage} scope has no requirements: {args.slice}")
-    if args.stage == "release" and args.slice:
+    if args.stage in {"deploy", "delivery", "release"} and args.slice:
         # Explicit incremental release. Keep full source/map/graph validation above.
         # A slice may ship independently only if its dependency closure has valid,
         # previously VERIFIED evidence. The full-epic release remains the default.
@@ -282,57 +398,75 @@ def check(args) -> int:
                                 errors.append(f"{rid}: required dependency {dep} is not evidenced VERIFIED")
             except (OSError, ValueError, KeyError, TypeError) as exc:
                 errors.append(f"scoped release graph cannot be verified: {exc}")
-    if args.stage in {"review", "release"}:
+    deferred = []
+    if args.stage in CANDIDATE_STAGES:
         expected = data.get("candidate_commit")
         if not args.candidate or not expected or args.candidate != expected:
             errors.append("candidate mismatch; map candidate_commit must match --candidate")
+        repo = Path(args.repo)
         if strict:
-            verify_real_commit(Path(args.repo), args.candidate or "", errors, "candidate")
+            verify_real_commit(repo, args.candidate or "", errors, "candidate")
         for row in scoped_required:
             rid = row.get("req_id", row.get("source_id", "?"))
             if optional_owner_check(row):
-                # Owner chose non-blocking personal observation. This does not
-                # mark the feature VERIFIED: referenced engineering rows still
-                # pass regular review/release evidence and status checks.
                 continue
-            postdeploy = bool(row.get("live_required")) and row.get("live_when") == "postdeploy"
+            postdeploy = row.get("live_required") is True and row.get("live_when") == "postdeploy"
+            predeploy_stage = args.stage in {"review", "deploy"}
+            state = row.get("status")
+            pending_future = args.stage == "delivery" and state == "READY_FOR_LIVE" and future_observation(row)
             allowed = {"VERIFIED"}
-            if args.stage == "review" and postdeploy:
+            if predeploy_stage:
+                allowed.add("REVIEW")
+                if postdeploy:
+                    allowed.add("READY_FOR_LIVE")
+            if pending_future:
                 allowed.add("READY_FOR_LIVE")
-            if row.get("status") not in allowed:
-                errors.append(f"{rid}: mandatory not {sorted(allowed)} (got {row.get('status')})")
+            if state not in allowed:
+                errors.append(f"{rid}: mandatory not {sorted(allowed)} (got {state})")
                 continue
-            ev = row.get("evidence", [])
-            if not isinstance(ev, list) or not ev:
-                errors.append(f"{rid}: evidence missing")
-                continue
-            bound = [x for x in ev if isinstance(x, dict) and x.get("candidate_commit") == args.candidate
-                     and str(x.get("ref", "")).strip() and str(x.get("observation", "")).strip()]
+            bound = bound_evidence(row, args.candidate, repo)
             if not bound:
                 errors.append(f"{rid}: no evidence bound to reviewed candidate")
-            if strict:
-                # One existing proof must be structurally valid; avoid requiring every prior
-                # obsolete note to point to a still-present artifact.
-                valid_artifact = False
-                for entry in bound:
-                    local_errors = []
-                    verify_artifact(Path(args.repo), entry, rid, local_errors)
-                    if not local_errors:
-                        valid_artifact = True
-                        break
-                if not valid_artifact:
-                    errors.append(f"{rid}: no candidate-bound evidence points to an existing repo artifact")
-            if row.get("live_required") and (args.stage == "release" or row.get("live_when", "preprod") == "preprod"):
-                acceptable = ("live", "ui", "provider") if args.stage == "review" else ("live", "production")
-                if not any(x.get("type") in acceptable for x in bound):
+                continue
+            proofs = valid_proofs(bound, repo, strict, rid)
+            if not proofs:
+                errors.append(f"{rid}: no candidate-bound evidence points to an existing repo artifact")
+            # A status or reviewer prose alone is insufficient. REVIEW requires
+            # independent approval plus actual implementation evidence. New deploy
+            # gate also checks approval for every mandatory row, including legacy VERIFIED.
+            if state == "REVIEW" or args.stage == "deploy" or pending_future or (predeploy_stage and state == "READY_FOR_LIVE" and future_observation(row)):
+                if not independent_approval(proofs, repo, rid, row.get("postrelease_wait") if state == "READY_FOR_LIVE" else None):
+                    errors.append(f"{rid}: missing candidate-bound independent Reviewer approval")
+                if not any(isinstance(x.get("type"), str) and x["type"] in {"unit", "integration", "e2e", "live", "production", "ui", "provider", "test", "manual", "static", "inspection", "contract", "smoke"} for x in proofs):
+                    errors.append(f"{rid}: missing candidate-bound implementation evidence")
+            if predeploy_stage and state == "REVIEW" and postdeploy:
+                # A postdeploy-only obligation must explicitly use READY_FOR_LIVE,
+                # not silently masquerade as an ordinary reviewed row.
+                errors.append(f"{rid}: postdeploy-only requirement must use READY_FOR_LIVE or VERIFIED")
+            if row.get("live_required") and not pending_future and (
+                    args.stage in POSTDEPLOY_STAGES or row.get("live_when", "preprod") == "preprod"):
+                acceptable = ("live", "ui", "provider") if predeploy_stage else ("live", "production")
+                if not any(x.get("type") in acceptable for x in proofs):
                     errors.append(f"{rid}: live requirement lacks evidence for stage {args.stage}")
-    if args.stage == "release":
-        if strict:
-            verify_real_commit(Path(args.repo), args.deployed_commit or "", errors, "deployed_commit (local existence only)")
-        if not args.deployed_commit or args.deployed_commit != args.candidate:
-            errors.append("deployed commit missing or differs from reviewed candidate")
-        if data.get("deployed_commit") != args.deployed_commit:
-            errors.append("map deployed_commit does not match actual deployment")
+            if pending_future:
+                deferred.append(str(rid))
+        if args.stage in POSTDEPLOY_STAGES:
+            if strict:
+                verify_real_commit(repo, args.deployed_commit or "", errors, "deployed_commit (local existence only)")
+            if not args.deployed_commit or args.deployed_commit != args.candidate:
+                errors.append("deployed commit missing or differs from reviewed candidate")
+            if data.get("deployed_commit") != args.deployed_commit:
+                errors.append("map deployed_commit does not match actual deployment")
+        if args.stage == "delivery":
+            # A delivery checkpoint needs actual deployment/smoke evidence even
+            # if every remaining requirement depends on a future event.
+            delivery = valid_proofs(bound_evidence({"evidence": data.get("delivery_evidence", [])}, args.candidate), repo, strict, "delivery")
+            if not any(x.get("type") == "production" and x.get("deployed_commit") == args.deployed_commit for x in valid_proofs(delivery, repo, True, "delivery")):
+                errors.append("delivery: missing candidate/deployed-bound production health evidence")
+    if args.stage == "delivery":
+        print("engineering_delivery=" + ("PASS" if not errors else "FAIL"))
+        print("acceptance=" + ("PENDING_FUTURE_EVIDENCE" if deferred else "RUN_RELEASE_GATE"))
+        print("deferred_req_ids=" + json.dumps(sorted(set(deferred))))
     for e in errors[:50]:
         print("FAIL:", e)
     if len(errors) > 50:
@@ -493,14 +627,25 @@ def main() -> int:
     i.add_argument("--force", action="store_true")
     c = sub.add_parser("check")
     c.add_argument("--map", required=True)
-    c.add_argument("--stage", choices=("plan", "review", "release"), required=True)
+    c.add_argument("--stage", choices=("plan", "review", "deploy", "delivery", "release"), required=True)
     c.add_argument("--slice", help="Review scope; on release, opt in to graph-validated incremental slice delivery (not parent DONE)")
     c.add_argument("--candidate")
     c.add_argument("--deployed-commit")
     c.add_argument("--graph", help="Optional JSON slice dependency/write-scope graph (see doc)")
     c.add_argument("--strict-evidence", action="store_true", help="Verify Git object and one real artifact per proven item; legacy maps require migration")
     c.add_argument("--repo", default=".", help="Repository root for strict Git/artifact checks (default: current directory)")
+    d = sub.add_parser("contract-digest", help="Digest of one requirement at evidence creation")
+    d.add_argument("--map", required=True)
+    d.add_argument("--req-id", required=True)
     a = ap.parse_args()
+    if a.command == "contract-digest":
+        data = json.loads(Path(a.map).read_text(encoding="utf-8"))
+        rows = [r for k in ("items", "additional_requirements") for r in data.get(k, [])
+                if isinstance(r, dict) and r.get("req_id") == a.req_id and r.get("disposition") == "required"]
+        if len(rows) != 1:
+            ap.error("contract-digest requires exactly one matching required row")
+        print(contract_digest(rows[0]))
+        return 0
     return init(a) if a.command == "init" else check(a)
 
 

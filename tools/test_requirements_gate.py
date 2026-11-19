@@ -38,6 +38,118 @@ class GateTests(unittest.TestCase):
                        evidence=[dict(type="live" if i == 0 else "integration", ref="logs/run-1", observation="passed", candidate_commit="a"*40)])
         self.save()
 
+    def approval(self, row, verdict="Approved", candidate="a"*40, wait=None):
+        (self.path / "review.md").write_text("Independent review artifact", encoding="utf8")
+        entry = dict(type="review", reviewer_role="Reviewer", verdict=verdict,
+                     ref="review.md", artifact_path="review.md", observation="Independent acceptance",
+                     candidate_commit=candidate)
+        if wait is not None:
+            entry["approved_postrelease_wait"] = wait
+        row["evidence"].append(entry)
+
+    def stage(self, name, expected, slice=None):
+        args = ["check", "--map", str(self.map), "--stage", name,
+                "--candidate", "a"*40, "--repo", str(self.path)]
+        if slice:
+            args += ["--slice", slice]
+        if name in ("release", "delivery"):
+            args += ["--deployed-commit", "a"*40]
+        return self.run_gate(*args, expected=expected)
+
+    def test_review_can_pass_before_deployment_but_not_close_release(self):
+        self.configure()
+        row = self.data["items"][1]
+        row["status"] = "REVIEW"
+        self.data["deployed_commit"] = ""
+        self.save()
+        self.stage("review", 1, "A")
+        self.approval(row)
+        self.approval(self.data["items"][0])
+        self.save()
+        self.stage("review", 0, "A")
+        self.stage("deploy", 0)
+        self.stage("release", 1)
+        self.data["deployed_commit"] = "a"*40
+        row["status"] = "VERIFIED"
+        self.save()
+        self.stage("release", 0)
+
+    def test_review_rejects_unapproved_stale_or_prose_only(self):
+        self.configure()
+        row = self.data["items"][1]
+        row["status"] = "REVIEW"
+        self.approval(row, verdict="Needs Fixes")
+        self.save()
+        self.stage("review", 1, "A")
+        row["evidence"][-1]["verdict"] = "Approved"
+        row["evidence"][-1]["candidate_commit"] = "b"*40
+        self.save()
+        self.stage("review", 1, "A")
+        row["evidence"][-1]["candidate_commit"] = "a"*40
+        row["evidence"][-1]["artifact_path"] = "missing.md"
+        self.save()
+        self.stage("review", 1, "A")
+        row["evidence"][-1]["artifact_path"] = "review.md"
+        row["evidence"] = row["evidence"][-1:]
+        self.save()
+        self.stage("review", 1, "A")
+
+    def test_review_still_requires_executable_preprod_live(self):
+        self.configure()
+        row = self.data["items"][1]
+        row.update(status="REVIEW", live_required=True, live_when="preprod")
+        self.approval(row)
+        self.save()
+        self.stage("review", 1, "A")
+        row["evidence"][0]["type"] = "ui"
+        self.save()
+        self.stage("review", 0, "A")
+
+    def test_delivery_parks_only_explicit_approved_future_evidence(self):
+        self.configure()
+        row = self.data["items"][0]
+        row.update(status="READY_FOR_LIVE", evidence=[dict(type="integration", ref="test", observation="passed", candidate_commit="a"*40)])
+        wait = dict(nonblocking=True, reason="natural event cannot be triggered safely", trigger="first natural event",
+                    next_check="on event", owner="DevOps", contract_ref="REQ-1 frozen acceptance")
+        row["postrelease_wait"] = wait
+        self.approval(row, verdict="Approved for controlled deployment", wait=wait.copy())
+        self.approval(self.data["items"][1])
+        (self.path / "smoke.md").write_text("Deployed SHA and smoke", encoding="utf8")
+        self.data["delivery_evidence"] = [dict(type="production", ref="smoke.md", artifact_path="smoke.md",
+            observation="actual deployment and smoke passed", candidate_commit="a"*40, deployed_commit="a"*40)]
+        self.save()
+        self.stage("review", 0, "A")
+        self.stage("deploy", 0)
+        self.assertIn('deferred_req_ids=["REQ-1"]', self.stage("delivery", 0))
+        self.stage("release", 1)
+        # A different event/contract cannot be deferred using stale approval.
+        row["postrelease_wait"]["trigger"] = "different event"
+        self.save()
+        self.stage("delivery", 1)
+        row["postrelease_wait"]["trigger"] = "first natural event"
+        self.data["delivery_evidence"][0]["deployed_commit"] = "b"*40
+        self.save()
+        self.stage("delivery", 1)
+        self.data["delivery_evidence"][0]["deployed_commit"] = "a"*40
+        row["status"] = "FAILED"
+        self.save()
+        self.stage("delivery", 1)
+        row["status"] = "READY_FOR_LIVE"
+        row["evidence"].append(dict(type="production", ref="event", observation="actual event observed", candidate_commit="a"*40))
+        row["status"] = "VERIFIED"
+        self.save()
+        self.stage("release", 0)
+
+    def test_delivery_does_not_waive_immediate_canary(self):
+        self.configure()
+        row = self.data["items"][0]
+        row["status"] = "READY_FOR_LIVE"
+        self.save()
+        self.stage("delivery", 1)
+        row["postrelease_wait"] = {"nonblocking": True}
+        self.save()
+        self.stage("delivery", 1)
+
     def test_missing_mapping_blocks_plan(self):
         self.run_gate("check", "--map", str(self.map), "--stage", "plan", expected=1)
 
@@ -247,6 +359,62 @@ class GateTests(unittest.TestCase):
                       "--repo", str(repo), "--strict-evidence", expected=0)
 
 
+
+    def test_metadata_reuse_preserves_proof_but_rejects_product_and_contract_change(self):
+        if not shutil.which("git"):
+            self.skipTest("git not available")
+        self.configure()
+        repo = self.path / "repo"
+        repo.mkdir()
+        def git(*args):
+            return subprocess.run(["git", "-C", str(repo), *args], check=True,
+                                  text=True, capture_output=True).stdout.strip()
+        git("init", "-q")
+        git("config", "user.email", "test@example.invalid")
+        git("config", "user.name", "Gate Test")
+        (repo / "app.py").write_text("value = 1\n")
+        git("add", ".")
+        git("commit", "-qm", "code")
+        old = git("rev-parse", "HEAD")
+        proof = repo / "plans/features/x/evidence/review.md"
+        proof.parent.mkdir(parents=True)
+        proof.write_text("Independent recorded review and actual test result")
+        digest = hashlib.sha256(proof.read_bytes()).hexdigest()
+        for row in self.data["items"]:
+            row.update(status="REVIEW", live_required=False, live_when="preprod")
+            row["evidence"] = []
+        self.save()
+        for row in self.data["items"]:
+            contract = self.run_gate("contract-digest", "--map", str(self.map), "--req-id", row["req_id"], expected=0).strip()
+            base = dict(candidate_commit=old, ref="review", artifact_path=proof.relative_to(repo).as_posix(),
+                        artifact_sha256=digest, contract_sha256=contract, reuse_on_metadata=True,
+                        observation="checked original candidate")
+            row["evidence"] = [dict(base, type="integration"), dict(base, type="review", reviewer_role="Reviewer", verdict="Approved")]
+        git("add", ".")
+        git("commit", "-qm", "evidence only")
+        current = git("rev-parse", "HEAD")
+        def check(candidate, expected):
+            self.data["candidate_commit"] = candidate
+            self.save()
+            self.run_gate("check", "--map", str(self.map), "--stage", "review", "--slice", "A",
+                          "--candidate", candidate, "--repo", str(repo), "--strict-evidence", expected=expected)
+        check(current, 0)
+        row = self.data["items"][0]
+        row["acceptance"] = "A materially different observable requirement"
+        check(current, 1)
+        row["acceptance"] = "observable behavior succeeds"
+        check(current, 0)
+        proof.write_text("tampered proof")
+        check(current, 1)
+        proof.write_text("Independent recorded review and actual test result")
+        (repo / "app.py").write_text("value = 2\n")
+        git("add", "app.py")
+        git("commit", "-qm", "code changed")
+        check(git("rev-parse", "HEAD"), 1)
+        # Production/live evidence cannot be carried by the offline exception.
+        for r in self.data["items"]:
+            r["evidence"][0]["type"] = "production"
+        check(current, 1)
 
     def test_graph_declared_on_map_is_automatically_checked(self):
         self.configure()

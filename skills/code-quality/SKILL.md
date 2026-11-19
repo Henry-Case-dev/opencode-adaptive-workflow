@@ -84,10 +84,9 @@ An in-scope contract failure, introduced regression or necessary shared-cause fi
 
 If none of these applies, accept proportionate straightforward code. Good engineering is not maximal complexity or maximal ceremony.
 
+
 ## Per-check disposable evidence hygiene
 
 When an existing test/probe finishes (PASS, FAIL or interruption), first keep the smallest durable candidate-bound proof and exact reproduction needed for subsequent repair/review. Then, if this role created its own disposable run via `workflow_housekeeping.py allocate --unit <stable-id>`, preview and run `run-close --repo ... --epic ... --path ... --confirmed-idle --confirmed-evidence --apply` once the command/browser/server and any consumers are truly finished. At the task/feature handoff, similarly run scoped `unit-close`. Never delete failing evidence still needed to reproduce a problem, active worktrees, user data, shared indexes or another agent's outputs. This is ordinary tool cleanup, not a new independent test phase or new full harness.
 
-## Epic corrective convergence (apply within existing role handoffs)
-
-Use the global mandatory epic closure protocol: freeze the owner-backed observable acceptance before implementation; classify each finding by contract/candidate impact, demonstrated critical harm, or independent backlog. Scope freeze never prevents independent discovery of a new material defect. Keep one deduplicated root-cause finding set in the existing review artifact; re-review fixed findings, changed and impacted invariants, and credible newly exposed mandatory risk. Reuse candidate/config-applicable proof only; preserve independent implementation, test-validity and risk-driven falsification checks. Do not reopen unchanged accepted proof or add a new acceptance criterion for unrelated polish. Batch compatible mandatory corrections into one reviewed integrated release candidate; do not bypass exact-artifact review or mandatory deployment checks. Treat a genuinely future-only mandatory production observation as unverified evidence with a durable trigger, not a reason for idle development or false DONE. No time/review-count quota, new test platform or added approval ceremony.
+Apply global AGENTS.md for scope/finding triage, independent review, evidence reuse and closure.

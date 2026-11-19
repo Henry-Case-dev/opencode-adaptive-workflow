@@ -1,5 +1,5 @@
 /**
- * OpenCode V2 continuation guard (v4.4). Opts in implicitly only through a real primary
+ * OpenCode V2 continuation guard (v4.5). Opts in implicitly only through a real primary
  * Orchestrator MODEL CONTEXT hook; NEVER parses user text or starts stale sessions.
  * Uses V2 session.execution.* lifecycle, not deprecated session.idle.
  */
@@ -10,11 +10,12 @@ import crypto from 'node:crypto';
 import { normalizePath, evaluateWork, sessionMatches, eventSessionId, eventReason,
   safePermissionCount, fingerprint, assessAttempt, positiveInt } from './core.mjs';
 
-const RESUME_TEXT = 'Автоматическое продолжение существующей рабочей сессии после неожиданного завершения хода. Это не новое задание и не разрешение на Human Gate. Сверь фактическое состояние очереди, результаты исполнителей, Git и ревью. Не повторяй завершённую работу. Если есть готовый шаг, запусти его до отчёта; если всё завершено или есть настоящий блокер — зафиксируй состояние и остановись. Соблюдай правила тестирования и безопасности текущего проекта. Отчитайся понятным языком согласно пользовательским настройкам.';
+const RESUME_TEXT = 'Автоматическое продолжение уже активной рабочей сессии после неожиданного завершения хода. Это не новое задание и не разрешение на Human Gate. Сверь фактическое состояние очереди, результаты исполнителей, git и ревью. Не повторяй завершённую работу. Если есть готовый следующий шаг, запусти его до отчёта; если всё завершено или есть настоящий блокер — зафиксируй состояние и не продолжай. Не посылай тестовые сообщения в рабочие чаты. Отчитайся простым русским языком.';
 const defaults = Object.freeze({enabled:true,pollMs:20000,minIdleMs:60000,cooldownMs:90000,
   maxAttemptsWithoutProgress:2,maxIdleAgeHours:8,dryRun:false,sessionLeaseHours:36,agent:'Orchestrator'});
 const empty = () => ({version:4,armedSessionId:null,agent:null,armedUntil:0,
   lastStartedAt:0,lastSucceededAt:0,lastAttemptForEnd:0,lastAttemptAt:0,
+  childSessions:{},childCoverage:false,childCoverageReason:null,
   attempts:0,signature:null,suspended:false,pendingOwnerPrompt:false});
 
 function safeError(e){return String(e?.message ?? e).slice(0,300)}
@@ -33,7 +34,7 @@ export async function startGuard(ctx,{pluginDir,logger,now=()=>Date.now(),setInt
   clearIntervalFn=clearInterval}={}){
   const repo=path.resolve(ctx.location?.directory ?? ctx.location?.project?.canonical ?? process.cwd());
   const stateKey=`guard/v4/${crypto.createHash('sha256').update(normalizePath(repo)).digest('hex').slice(0,20)}`;
-  const logRoot=path.resolve(pluginDir, '..', '..', 'WorkspaceData', 'registry', 'continuation-guard');
+  const logRoot=path.join(process.env.LOCALAPPDATA||path.join(os.homedir(),'.local','state'),'OpenCode','continuation-guard');
   const log=logger|| (async (event,extra={})=>{try{
     await fs.mkdir(logRoot,{recursive:true});
     const f=path.join(logRoot,'events.log');
@@ -42,7 +43,7 @@ export async function startGuard(ctx,{pluginDir,logger,now=()=>Date.now(),setInt
     await fs.appendFile(f,JSON.stringify({at:new Date().toISOString(),event,...extra})+'\n');
   }catch{}});
   let s=empty(),disposed=false,checking=false,ready=false;
-  let promptRegistration=null,contextRegistration=null,timer=null;
+  let promptRegistration=null,contextRegistration=null,idleRegistration=null,timer=null;
   let eventController=new AbortController();
   let automaticPromptInFlight=false;
   const runningChildren=new Set();
@@ -103,6 +104,14 @@ export async function startGuard(ctx,{pluginDir,logger,now=()=>Date.now(),setInt
       if(s.suspended && !s.pendingOwnerPrompt)return;
       const fresh=s.armedSessionId!==id;
       if(fresh){s=empty();runningChildren.clear();}
+      else if(s.childSessions){
+        // A new actual primary model turn is the natural handoff boundary.
+        // Retire only terminal child observations, never live/unknown work.
+        for(const [child,record] of Object.entries(s.childSessions)){
+          if(['succeeded','failed','interrupted','quiescent'].includes(record?.state))
+            delete s.childSessions[child];
+        }
+      }
       s.armedSessionId=id;s.agent=cfg.agent;s.armedUntil=t+cfg.leaseMs;
       // An actual primary model call is strong proof that this execution started.
       s.lastStartedAt=t;s.lastSucceededAt=0;
@@ -123,21 +132,48 @@ export async function startGuard(ctx,{pluginDir,logger,now=()=>Date.now(),setInt
     await save();
     await logEvent('external-prompt-admitted',{sessionId:id});
   }
+  // Native V2 execution events are evidence of a child turn, not proof that
+  // its result was delivered to the parent. Keep child identities in the same
+  // durable guard state; a process-local Set alone is lost on desktop restart.
+  async function trackChild(event,id,type){
+    if(!s.armedSessionId || !id || id===s.armedSessionId)return false;
+    const p=event?.properties??event?.data??{};
+    let parent=p.info?.parentID??p.parentID??null;
+    if(!parent && s.childSessions?.[id])parent=s.armedSessionId;
+    if(!parent){
+      try{const info=await bounded(ctx.session.get({sessionID:id}),4000,'child-get');
+        parent=(info?.data??info)?.parentID??null;}
+      catch{return false;}
+    }
+    if(parent!==s.armedSessionId)return false;
+    const children=s.childSessions??(s.childSessions={});
+    const prev=children[id]??{state:'observed',at:now()};
+    let state=prev.state;
+    if(type==='session.execution.started')state='running';
+    if(type==='session.execution.succeeded')state='succeeded';
+    if(type==='session.execution.failed')state='failed';
+    if(type==='session.execution.interrupted')state='interrupted';
+    if(type==='session.deleted')state='missing';
+    children[id]={...prev,state,at:now()};
+    if(state==='running')runningChildren.add(id);
+    else if(['succeeded','failed','interrupted','missing'].includes(state))runningChildren.delete(id);
+    await save();
+    if(['succeeded','failed','interrupted'].includes(state)){
+      await logEvent('child-terminal-observed',{sessionId:id,parentID:parent,outcome:state});
+      // Reconciliation on the already-installed guard timer is safe and does
+      // not inject another completion notification or start a new watcher.
+    }
+    return true;
+  }
   async function onEvent(event){
     if(disposed)return;
     const id=eventSessionId(event);
     const type=eventType(event);
     if(!id||!s.armedSessionId)return;
     if(id!==s.armedSessionId){
-      if(type==='session.execution.started'){
-        // A running child may outlive the parent turn; do not wake its parent.
-        try{
-          const child=await bounded(ctx.session.get({sessionID:id}),4000,'child-get');
-          if(child?.parentID===s.armedSessionId)runningChildren.add(id);
-        }catch{}
-      }
-      if(type==='session.execution.succeeded'||type==='session.execution.failed'||
-        type==='session.execution.interrupted')runningChildren.delete(id);
+      if(['session.created','session.execution.started','session.execution.succeeded',
+        'session.execution.failed','session.execution.interrupted','session.deleted'].includes(type))
+        await trackChild(event,id,type);
       return;
     }
     const t=now();
@@ -145,13 +181,10 @@ export async function startGuard(ctx,{pluginDir,logger,now=()=>Date.now(),setInt
       s.lastStartedAt=t;s.lastSucceededAt=0;s.armedUntil=t+(lastConfig?.leaseMs??defaults.sessionLeaseHours*3600000);
       await save();return;
     }
-    if(type==='session.execution.succeeded'||type==='session.idle'||
-      (type==='session.status'&&event?.properties?.status?.type==='idle')){
-      // A successful V2 execution is authoritative. Legacy idle is not proof of success.
-      if(type!=='session.execution.succeeded')return;
-      s.lastSucceededAt=t;
-      await save();return;
+    if(type==='session.execution.succeeded'){
+      s.lastSucceededAt=t;await save();return;
     }
+    // session.idle/status idle is not an authoritative execution result.
     if(type==='session.execution.interrupted'||type==='session.execution.failed'||type==='session.error'){
       s.suspended=true;s.suspendedAt=t;s.pendingOwnerPrompt=false;s.lastSucceededAt=0;
       await save();
@@ -159,47 +192,68 @@ export async function startGuard(ctx,{pluginDir,logger,now=()=>Date.now(),setInt
     }
     if(type==='session.deleted')await clear('session-deleted');
   }
-  // Reconstruct child state from the authoritative session inventory on EVERY
-  // resume attempt. The in-memory runningChildren set is event-only and can be
-  // empty after event loss/reconnect, or when a child was launched earlier.
-  // If inventory/status APIs are unavailable, fail CLOSED: never inject a new
-  // root prompt while an unobserved Builder/Reviewer might still be running.
+  // Native plugin V2's experimental.idle hook exposes background work at an
+  // actual primary idle boundary. It is a snapshot, not a liveness heartbeat.
+  // Unknown job identifiers must not silently become 'no children'.
+  async function onNativeIdle(event){
+    if(disposed||event?.sessionID!==s.armedSessionId)return;
+    if(!Array.isArray(event.background))return;
+    let complete=true;
+    const children=s.childSessions??(s.childSessions={});
+    for(const job of event.background){
+      // A running background shell/image is also real work: never declare
+      // the root quiescent while it exists. Only subagent children can be
+      // checked by session.wait; other job types need a fresh native snapshot.
+      if(job?.kind!=='subagent'){complete=false;continue;}
+      const id=job.childSessionID??job.childID??job.subagentSessionID??
+        (job.sessionID!==s.armedSessionId?job.sessionID:null);
+      if(typeof id!=='string'||!id){complete=false;continue;}
+      children[id]??={state:'observed',at:now()};
+    }
+    s.childCoverage=complete;
+    s.childCoverageReason=complete?'native-idle-background':'unidentified-native-background';
+    await save();
+  }
+  // Optional inventory is useful on hosts exposing session.list, but that API
+  // is NOT required by the current V2 Promise Plugin domain. For hosts without
+  // it, use tracked child IDs plus a real idle snapshot. After an event gap,
+  // unknown work remains UNKNOWN, not completed.
   let lastChildSkip='';
   async function ensureChildrenQuiescent(rootID){
-    if(typeof ctx.session.list!=='function')
-      return {ok:false,reason:'session-list-unavailable'};
-    const children=new Set(runningChildren);
-    let cursor=null;
-    const cursors=new Set();
-    for(let pageNo=0;pageNo<12;pageNo++){
-      const params={directory:repo,parentID:rootID,limit:100};
-      if(cursor)params.cursor=cursor;
-      let response;
-      try{response=await bounded(ctx.session.list(params),10000,'list-children')}
-      catch{return {ok:false,reason:'child-inventory-error'}}
-      const rows=Array.isArray(response)?response:
-        (response?.items??response?.data?.items??response?.sessions??response?.data?.sessions??(Array.isArray(response?.data)?response.data:undefined));
-      if(!Array.isArray(rows))return {ok:false,reason:'child-inventory-unrecognized'};
-      for(const item of rows){
-        if(typeof item?.id!=='string'||typeof item?.parentID!=='string')
-          return {ok:false,reason:'child-inventory-incomplete'};
-        if(item.parentID!==rootID)return {ok:false,reason:'child-inventory-mismatch'};
-        children.add(item.id);
+    const children=new Set([...Object.keys(s.childSessions??{}),...runningChildren]);
+    let inventoryComplete=false;
+    if(typeof ctx.session.list==='function'){
+      let cursor=null;const cursors=new Set();
+      for(let pageNo=0;pageNo<12;pageNo++){
+        const params={directory:repo,parentID:rootID,limit:100};
+        if(cursor)params.cursor=cursor;
+        let response;
+        try{response=await bounded(ctx.session.list(params),10000,'list-children')}
+        catch{return {ok:false,reason:'child-inventory-error'}}
+        const rows=Array.isArray(response)?response:
+          (response?.items??response?.data?.items??response?.sessions??response?.data?.sessions??
+          (Array.isArray(response?.data)?response.data:undefined));
+        if(!Array.isArray(rows))return {ok:false,reason:'child-inventory-unrecognized'};
+        for(const item of rows){
+          if(typeof item?.id!=='string'||item.parentID!==rootID)
+            return {ok:false,reason:'child-inventory-incomplete-or-mismatch'};
+          children.add(item.id);
+        }
+        const next=response?.cursor?.next??response?.data?.cursor?.next??null;
+        if(!next){inventoryComplete=true;break;}
+        if(cursors.has(next)||pageNo===11)return {ok:false,reason:'child-inventory-truncated'};
+        cursors.add(next);cursor=next;
       }
-      const next=response?.cursor?.next??response?.data?.cursor?.next??null;
-      if(!next)break;
-      if(cursors.has(next)||pageNo===11)return {ok:false,reason:'child-inventory-truncated'};
-      cursors.add(next);cursor=next;
     }
-    // A child session is active if wait has not resolved. Unknown errors are
-    // likewise a reason to defer; never treat a timeout as completed work.
+    if(!inventoryComplete && !s.childCoverage)
+      return {ok:false,reason:'child-roster-unverified'};
     const ids=[...children];
+    if(typeof ctx.session.wait!=='function')return {ok:false,reason:'child-wait-unavailable'};
     for(let start=0;start<ids.length;start+=12){
-      const chunk=ids.slice(start,start+12);
-      const results=await Promise.all(chunk.map(async id=>{
+      const results=await Promise.all(ids.slice(start,start+12).map(async id=>{
         const ac=new AbortController();
         try{await bounded(ctx.session.wait({sessionID:id},{signal:ac.signal}),1800,'child-wait',ac);
-          runningChildren.delete(id);return {id,ok:true};}
+          return {id,ok:true};}
         catch{return {id,ok:false};}
       }));
       const pending=results.find(r=>!r.ok);
@@ -317,10 +371,14 @@ export async function startGuard(ctx,{pluginDir,logger,now=()=>Date.now(),setInt
       // Do not reactivate a possibly stale state on startup. Only a newly
       // observed native primary model call can renew its execution lease.
       s.lastSucceededAt=0;s.lastStartedAt=0;s.pendingOwnerPrompt=false;
+      s.childCoverage=false;s.childCoverageReason='backend-restarted';
+      s.childSessions=(s.childSessions&&typeof s.childSessions==='object'&&!Array.isArray(s.childSessions))?s.childSessions:{};
       await save();
     }
     contextRegistration=await ctx.session.hook('context',modelContext);
     promptRegistration=await ctx.session.hook('prompt',promptAdmission);
+    try{idleRegistration=await ctx.session.hook('experimental.idle',onNativeIdle)}
+    catch(e){await logEvent('native-idle-hook-unavailable',{message:safeError(e)})}
     ready=true;
     // Use real V2 execution events. Never depend solely on deprecated idle.
     void (async()=>{
@@ -332,9 +390,11 @@ export async function startGuard(ctx,{pluginDir,logger,now=()=>Date.now(),setInt
             retries=0;
             await onEvent(event);
           }
-          if(!disposed)await logEvent('event-stream-ended');
+          if(!disposed){s.childCoverage=false;s.childCoverageReason='event-stream-ended';
+            await save();await logEvent('event-stream-ended');}
         }catch(e){
-          if(!disposed)await logEvent('event-stream-error',{message:safeError(e)});
+          if(!disposed){s.childCoverage=false;s.childCoverageReason='event-stream-error';
+            await save();await logEvent('event-stream-error',{message:safeError(e)});}
         }
         if(disposed)break;
         // Reconnect without any model calls. A dropped event stream must not
@@ -348,12 +408,13 @@ export async function startGuard(ctx,{pluginDir,logger,now=()=>Date.now(),setInt
       }
     })();
     timer=setIntervalFn(()=>{void check('timer')},cfg.pollMs);
-    await logEvent('plugin-loaded',{version:'4.4',sessionTracking:'model-context-and-execution-events'});
+    await logEvent('plugin-loaded',{version:'4.5',sessionTracking:'model-context-and-execution-events'});
     return async()=>{
       disposed=true;ready=false;
       if(timer!==null)clearIntervalFn(timer);
       eventController.abort();
       await promptRegistration?.dispose?.();await contextRegistration?.dispose?.();
+      await idleRegistration?.dispose?.();
     };
   }
   return {init,check,onEvent,modelContext,promptAdmission,getState:()=>({...s})};

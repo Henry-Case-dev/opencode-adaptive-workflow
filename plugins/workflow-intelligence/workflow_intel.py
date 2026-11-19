@@ -66,7 +66,8 @@ def _expand(p: str) -> Path:
 
 def workspace_root() -> Path:
     # Derive from installed OpenCode global config, not OS temp/project-specific paths.
-    return Path(__file__).resolve().parents[2] / "WorkspaceData"
+    override = os.environ.get("OPENCODE_WORKSPACE_DATA", "").strip()
+    return _expand(override) if override else Path(__file__).resolve().parents[2] / "WorkspaceData"
 
 
 def global_cache_root() -> Path:
@@ -768,7 +769,7 @@ def scratch_status(repo: Path) -> dict:
     return {
         "path": str(p), "exists": p.exists(), "bytes": size, "files_seen": count,
         "root_configured": bool(os.environ.get("OPENCODE_WORKFLOW_SCRATCH_ROOT", "").strip()),
-        "gc": "workflow.intelligence plugin removes only managed scratch children older than TTL; durable evidence must be promoted first",
+        "gc": "No TTL cleanup. Use scoped housekeeping after confirmed idle consumers and evidence preservation.",
     }
 
 

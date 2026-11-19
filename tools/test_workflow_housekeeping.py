@@ -96,7 +96,8 @@ class HygieneTests(unittest.TestCase):
         except (OSError, NotImplementedError):
             self.skipTest('symlink unavailable')
         result=self.cli('run-close','--repo',self.repo,'--epic','safe','--path',run,
-                        '--apply','--confirmed-idle','--confirmed-evidence')
+                        '--apply','--confirmed-idle','--confirmed-evidence',ok=False)
+        self.assertEqual(3,result.returncode)
         self.assertIn('KEEP',result.stdout)
         self.assertTrue(run.exists())
         self.assertTrue((precious/'user.txt').exists())
@@ -114,7 +115,8 @@ class HygieneTests(unittest.TestCase):
         outside=self.dir/'user-owned';outside.mkdir();(outside/'source.txt').write_text('unique')
         for target in [outside,one]:
             r=self.cli('run-close','--repo',self.repo,'--epic','wrong','--path',target,
-                       '--apply','--confirmed-idle','--confirmed-evidence')
+                       '--apply','--confirmed-idle','--confirmed-evidence',ok=False)
+            self.assertEqual(3,r.returncode)
             self.assertIn('KEEP',r.stdout)
         self.assertTrue(one.exists())
         self.assertTrue((outside/'source.txt').exists())
@@ -133,7 +135,8 @@ class HygieneTests(unittest.TestCase):
         a=Path(self.cli('allocate','--repo',self.repo,'--epic','e','--unit','f1','--kind','probe').stdout.strip())
         (a/'review.sqlite').write_text('not disposable')
         r=self.cli('unit-close','--repo',self.repo,'--epic','e','--unit','f1',
-                   '--apply','--confirmed-idle','--confirmed-evidence')
+                   '--apply','--confirmed-idle','--confirmed-evidence',ok=False)
+        self.assertEqual(3,r.returncode)
         self.assertIn('KEEP',r.stdout)
         self.assertTrue(a.exists())
 
@@ -157,7 +160,8 @@ class HygieneTests(unittest.TestCase):
         data=json.loads(reg.read_text());data['unit']='f';reg.write_text(json.dumps(data))
         (wt/'private.patch').write_text('unique changes')
         r=self.cli('unit-close','--repo',self.repo,'--epic','dirtyunit','--unit','f',
-                   '--apply','--confirmed-idle','--confirmed-evidence')
+                   '--apply','--confirmed-idle','--confirmed-evidence',ok=False)
+        self.assertEqual(3,r.returncode)
         self.assertIn('KEEP worktree',r.stdout)
         self.assertTrue(wt.exists())
 
@@ -233,5 +237,73 @@ class HygieneTests(unittest.TestCase):
         (cache/'custom.db').write_text('not disposable')
         self.cli('epic-close','--repo',self.repo,'--epic','cache','--purge-disposable-cache','--confirmed-complete','--confirmed-idle','--apply')
         self.assertTrue(cache.exists())
+
+    def test_unit_check_requires_real_disposition_and_does_not_delete(self):
+        run=Path(self.cli('allocate','--repo',self.repo,'--epic','e','--unit','u').stdout.strip())
+        args=('unit-check','--repo',self.repo,'--epic','e','--unit','u')
+        r=self.cli(*args,ok=False)
+        self.assertEqual(3,r.returncode)
+        self.assertFalse(json.loads(r.stdout)['handoff_accounted'])
+        self.assertTrue(run.exists())
+        record=self.dir/'retention.json'
+        record.write_text(json.dumps({'cleanup_retained':[{'path':str(run),'owner':'Builder','reason':'Reviewer still consumes trace','evidence':'review assignment 1','next_event':'review joined'}]}))
+        r=self.cli(*args,'--retention-file',record)
+        data=json.loads(r.stdout)
+        self.assertTrue(data['handoff_accounted'])
+        self.assertFalse(data['cleanup_complete'])
+        self.assertTrue(run.exists())
+        self.cli('unit-close','--repo',self.repo,'--epic','e','--unit','u','--retention-file',record,'--apply','--confirmed-idle','--confirmed-evidence')
+        self.assertTrue(run.exists())
+        self.cli('unit-close','--repo',self.repo,'--epic','e','--unit','u','--apply','--confirmed-idle','--confirmed-evidence')
+        self.assertTrue(json.loads(self.cli(*args).stdout)['cleanup_complete'])
+
+    def test_inventory_includes_legacy_and_foreign_units_without_deleting(self):
+        run=Path(self.cli('allocate','--repo',self.repo,'--epic','e').stdout.strip())
+        (run/'x').write_bytes(b'abc')
+        legacy=self.config/'OpenCodeScratch'; legacy.mkdir();(legacy/'u').write_text('user')
+        data=json.loads(self.cli('inventory','--sizes').stdout)
+        bypath={r['path']:r for r in data['items']}
+        self.assertEqual('managed_run',bypath[str(run)]['category'])
+        self.assertEqual('legacy_inspect_only',bypath[str(legacy)]['category'])
+        self.assertTrue(run.exists()); self.assertTrue(legacy.exists())
+
+    def test_ignored_worktree_files_protect_user_data(self):
+        wt=self.setup_worktree('ignored')
+        # Ignore via the common Git exclude without altering tracked files.
+        (self.repo/'.git'/'info'/'exclude').write_text('private-data.txt\n')
+        (wt/'private-data.txt').write_text('unique')
+        record=next((self.workspace/'registry'/'worktrees').glob('*.json'))
+        data=json.loads(record.read_text());data['unit']='u';record.write_text(json.dumps(data))
+        r=self.cli('unit-close','--repo',self.repo,'--epic','ignored','--unit','u','--apply','--confirmed-idle','--confirmed-evidence',ok=False)
+        self.assertEqual(3,r.returncode)
+        self.assertTrue((wt/'private-data.txt').exists())
+
+    def test_retired_worktree_aux_is_removed_only_for_exact_owner(self):
+        import hashlib
+        wt=self.setup_worktree('aux')
+        reg=next((self.workspace/'registry'/'worktrees').glob('*.json'))
+        data=json.loads(reg.read_text());data['unit']='u';reg.write_text(json.dumps(data))
+        def scratch(repo):
+            key=repo.name+'-'+hashlib.sha1(str(repo).encode()).hexdigest()[:12]
+            folder=self.workspace/'temp'/'intelligence'/key
+            (folder/'tmp').mkdir(parents=True)
+            (folder/'tmp'/'x').write_text('temporary')
+            (folder/'.opencode-workflow-scratch.json').write_text(json.dumps({'repo':str(repo),'managedBy':'opencode-global-intelligence-v3'}))
+            return folder
+        owned=scratch(wt); shared=scratch(self.repo)
+        self.cli('unit-close','--repo',self.repo,'--epic','aux','--unit','u','--apply','--confirmed-idle','--confirmed-evidence')
+        self.assertFalse(wt.exists()); self.assertFalse(owned.exists()); self.assertFalse(reg.exists()); self.assertTrue(shared.exists())
+
+    def test_retired_aux_protected_content_keeps_registry(self):
+        import hashlib
+        wt=self.setup_worktree('auxprotected')
+        reg=next((self.workspace/'registry'/'worktrees').glob('*.json'))
+        data=json.loads(reg.read_text());data['unit']='u';reg.write_text(json.dumps(data))
+        key=wt.name+'-'+hashlib.sha1(str(wt).encode()).hexdigest()[:12]
+        folder=self.workspace/'temp'/'intelligence'/key; folder.mkdir(parents=True)
+        (folder/'.opencode-workflow-scratch.json').write_text(json.dumps({'repo':str(wt),'managedBy':'opencode-global-intelligence-v3'}))
+        (folder/'unknown.db').write_text('unique')
+        r=self.cli('unit-close','--repo',self.repo,'--epic','auxprotected','--unit','u','--apply','--confirmed-idle','--confirmed-evidence',ok=False)
+        self.assertEqual(3,r.returncode); self.assertTrue(reg.exists()); self.assertTrue(folder.exists()); self.assertFalse(wt.exists())
 
 if __name__=='__main__':unittest.main()

@@ -95,7 +95,7 @@ class LineageTests(unittest.TestCase):
 
     def test_queue_position_priority_and_blockers_do_not_disappear_between_sessions(self):
         old_task = dict(self.task("A", "PENDING"), queue_position=5, priority="P0",
-                        blocked_by=["EXAMPLE-ARCH"], blocker_sources={"EXAMPLE-ARCH":"plans/maps/a.json"})
+                        blocked_by=["PAY-ARCH"], blocker_sources={"PAY-ARCH":"plans/maps/a.json"})
         self.write_scope(self.repo, dict(self.current_scope, tasks=[old_task]))
         self.g("add", ".")
         self.g("commit", "-qm", "queued")
@@ -109,6 +109,19 @@ class LineageTests(unittest.TestCase):
         self.assertTrue(result["needs_reconciliation"])
         self.assertEqual(result["task_conflicts"][0]["fields"],
                          ["queue_position", "priority", "blocked_by"])
+
+    def test_delivery_wait_metadata_survives_lineage_comparison(self):
+        old_task = dict(self.task("A", "WAITING_EXTERNAL"), execution_state="delivered_awaiting_evidence",
+                        deferred_req_ids=["R1"], delivery_gate_ref="plans/delivery.log")
+        self.write_scope(self.repo, dict(self.current_scope, tasks=[old_task]))
+        self.g("add", ".")
+        self.g("commit", "-qm", "delivered")
+        delivered = self.g("rev-parse", "HEAD").strip()
+        newer = self.task("A", "WAITING_EXTERNAL")
+        self.write_scope(self.repo, dict(self.current_scope, tasks=[newer]))
+        result = wl.lineage(self.repo, [delivered], [])[0]
+        self.assertEqual(result["task_conflicts"][0]["fields"],
+                         ["execution_state", "deferred_req_ids", "delivery_gate_ref"])
 
     def test_worktree_detected_even_if_branch_not_checked_out(self):
         self.g("branch", "develop", self.old)

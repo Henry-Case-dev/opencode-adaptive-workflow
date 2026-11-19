@@ -221,8 +221,8 @@ class WorkflowProgressTests(unittest.TestCase):
         a = self.write_map("main.json", [("M1", "W1", "VERIFIED")])
         out = io.StringIO()
         with contextlib.redirect_stdout(out):
-            self.assertEqual(progress.main(["--map", a, "--json", "--label", "Example project"]), 0)
-        self.assertEqual(json.loads(out.getvalue())["scope"], "Example project")
+            self.assertEqual(progress.main(["--map", a, "--json", "--label", "SOUL"]), 0)
+        self.assertEqual(json.loads(out.getvalue())["scope"], "SOUL")
 
 
     def scope_with_inputs(self, tasks, inputs):
@@ -502,13 +502,39 @@ class TestDurableQueueRegistration(unittest.TestCase):
             self.assertTrue(any("queue_position" in x for x in snap["execution_queue"]["issues"]))
             self.assertTrue(any("blocked_by" in x for x in snap["execution_queue"]["issues"]))
 
+    def test_delivered_epic_parks_only_future_evidence_not_next_epic(self):
+        row = {"id": "delivered", "status": "WAITING_EXTERNAL", "queue_position": 1,
+               "priority": "P0", "blocked_by": [], "execution_state": "delivered_awaiting_evidence",
+               "deferred_req_ids": ["REQ-1"], "delivery_gate_ref": "delivery.log"}
+        next_row = {"id": "next", "status": "PENDING", "queue_position": 2,
+                    "priority": "P0", "blocked_by": []}
+        tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(tmp.cleanup)
+        root = Path(tmp.name)
+        (root / "delivery.log").write_text('engineering_delivery=PASS\nacceptance=PENDING_FUTURE_EVIDENCE\ndeferred_req_ids=["REQ-1"]\n', encoding="utf8")
+        mp = root / "delivery.json"
+        row["maps"] = [str(mp)]
+        data = {"schema": progress.SCHEMA, "items": [dict(disposition="required", req_id="REQ-1", slice="A", status="READY_FOR_LIVE")]}
+        data["items"][0].update(live_required=True, live_when="postdeploy", postrelease_wait=dict(nonblocking=True, reason="future only", trigger="event", next_check="on event", owner="DevOps", contract_ref="REQ-1"))
+        Path(mp).write_text(json.dumps(data))
+        result = progress.audit_execution_queue([row, next_row], project=root)
+        self.assertTrue(result["complete"])
+        self.assertEqual(result["parked_delivery_tasks"], ["delivered"])
+        self.assertEqual(result["entries"][0]["dispatch_disposition"], "parked_evidence")
+        self.assertEqual(result["entries"][1]["dispatch_disposition"], "assess_runnable")
+        data["items"][0]["status"] = "FAILED"
+        Path(mp).write_text(json.dumps(data))
+        result = progress.audit_execution_queue([row, next_row], project=root)
+        self.assertFalse(result["complete"])
+        self.assertEqual(result["parked_delivery_tasks"], [])
+
     def test_waiting_for_architect_still_has_queue_position(self):
         scope = [{"id": "EPIC-X", "status": "PENDING", "queue_position": 7,
-                  "priority": "P0", "blocked_by": ["EXAMPLE-ARCH"],
-                  "blocker_sources": {"EXAMPLE-ARCH": "plans/features/epic-x/requirements-map.json"}}]
+                  "priority": "P0", "blocked_by": ["PAY-ARCH"],
+                  "blocker_sources": {"PAY-ARCH": "plans/features/epic-x/requirements-map.json"}}]
         result = progress.audit_execution_queue(scope)
         self.assertTrue(result["complete"], result["issues"])
-        self.assertEqual(result["entries"][0]["blocked_by"], ["EXAMPLE-ARCH"])
+        self.assertEqual(result["entries"][0]["blocked_by"], ["PAY-ARCH"])
 
     def test_duplicate_positions_and_dependency_cycle_are_rejected(self):
         scope = [{"id": "A", "status": "BUILDING", "priority": "P0",
@@ -530,7 +556,7 @@ class TestDurableQueueRegistration(unittest.TestCase):
 
     def test_untraced_nontask_blocker_rejected(self):
         result = progress.audit_execution_queue([{"id": "epic", "status": "PENDING",
-                       "queue_position": 3, "priority": "P0", "blocked_by": ["EXAMPLE-ARCH"]}])
+                       "queue_position": 3, "priority": "P0", "blocked_by": ["PAY-ARCH"]}])
         self.assertFalse(result["complete"])
         self.assertTrue(any("blocker_sources" in x for x in result["issues"]))
 
@@ -546,8 +572,8 @@ class TestQueueSourceEvidence(unittest.TestCase):
         with tempfile.TemporaryDirectory() as d:
             root = Path(d)
             row = {"id":"EPIC", "status":"PENDING", "queue_position":1,
-                   "priority":"P0", "blocked_by":["EXAMPLE-ARCH"],
-                   "blocker_sources":{"EXAMPLE-ARCH":"plans/architecture.md"}}
+                   "priority":"P0", "blocked_by":["PAY-ARCH"],
+                   "blocker_sources":{"PAY-ARCH":"plans/architecture.md"}}
             result = progress.audit_execution_queue([row], project=root)
             self.assertFalse(result["complete"])
             (root / "plans").mkdir()

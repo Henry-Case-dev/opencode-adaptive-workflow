@@ -110,6 +110,9 @@ class Snapshot:
                     values[rid] = {
                         "status": row.get("status"), "slice": row.get("slice"),
                         "verification_tier": row.get("verification_tier", "engineering"),
+                        "live_required": row.get("live_required"),
+                        "live_when": row.get("live_when"),
+                        "postrelease_wait": row.get("postrelease_wait"),
                         "candidate_sha": row.get("candidate_sha"),
                         "artifact_path": row.get("artifact_path"),
                         "evidence": row.get("evidence"),
@@ -151,7 +154,8 @@ def compare(current: Snapshot, reference: Snapshot) -> dict:
     for tid in sorted(tasks_a.keys() & tasks_b.keys()):
         x, y = tasks_a[tid], tasks_b[tid]
         compare_fields = ["status", "coverage_complete", "source_sha256", "cancelled_by_input",
-                          "queue_position", "priority", "blocked_by", "blocker_sources"]
+                          "queue_position", "priority", "blocked_by", "blocker_sources",
+                          "execution_state", "deferred_req_ids", "delivery_gate_ref"]
         changed = [f for f in compare_fields if x.get(f) != y.get(f)]
         try:
             xa = sorted(safe_rel(m, current.root) for m in x.get("maps", []))

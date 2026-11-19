@@ -38,6 +38,7 @@ def audit_execution_queue(tasks: list[dict], project: Path | None = None) -> dic
     issues: list[str] = []
     entries: list[dict] = []
     edges: dict[str, list[str]] = {}
+    parked_delivery_tasks: list[str] = []
     for row in open_rows:
         tid = str(row.get("id") or "(no id)")
         pos, priority, blockers = row.get("queue_position"), row.get("priority"), row.get("blocked_by")
@@ -76,8 +77,66 @@ def audit_execution_queue(tasks: list[dict], project: Path | None = None) -> dic
                     if not source_path.is_file():
                         issues.append(f"{tid}: blocker_sources для {blocker} не найден: {ref}")
         edges[tid] = [b for b in blockers if b in all_ids and b != tid]
+        execution_state = row.get("execution_state", "")
+        parked = False
+        if execution_state == "delivered_awaiting_evidence":
+            # Engineering closure is separate from acceptance. Validate the
+            # recorded handoff; do not infer deployment or verification here.
+            ids, ref = row.get("deferred_req_ids"), row.get("delivery_gate_ref")
+            valid = (row.get("status") == "WAITING_EXTERNAL" and isinstance(ids, list)
+                     and bool(ids) and all(isinstance(x, str) and x.strip() for x in ids)
+                     and len(set(ids)) == len(ids) and isinstance(ref, str) and bool(ref.strip()))
+            if valid and project is not None:
+                receipt = _project_path(ref, project)
+                valid = receipt.is_relative_to(project.resolve()) and receipt.is_file()
+                # All outstanding mandatory rows must actually be postdeploy
+                # future evidence, never a disguised active repair or canary.
+                outstanding = set()
+                try:
+                    maps = row.get("maps", [])
+                    if not maps:
+                        valid = False
+                    for path in maps:
+                        data = json.loads(_project_path(path, project).read_text(encoding="utf-8-sig"))
+                        for req in data.get("items", []) + data.get("additional_requirements", []):
+                            if req.get("disposition") != "required" or optional_owner_check(req) or req.get("status") == "VERIFIED":
+                                continue
+                            outstanding.add(req.get("req_id"))
+                            wait = req.get("postrelease_wait")
+                            if (req.get("status") != "READY_FOR_LIVE" or req.get("live_required") is not True
+                                    or req.get("live_when") != "postdeploy" or not isinstance(wait, dict)
+                                    or wait.get("nonblocking") is not True
+                                    or not all(isinstance(wait.get(k), str) and wait[k].strip()
+                                               for k in ("reason", "trigger", "next_check", "owner", "contract_ref"))):
+                                valid = False
+                    valid = valid and outstanding == set(ids)
+                    if valid:
+                        # This checks the durable receipt, not the remote deployment.
+                        # The actual delivery gate must have run at handoff.
+                        lines = receipt.read_text(encoding="utf-8-sig").splitlines()
+                        receipt_ids = set()
+                        for line in lines:
+                            if line.startswith("deferred_req_ids="):
+                                values = json.loads(line.split("=", 1)[1])
+                                if not isinstance(values, list) or not all(isinstance(v, str) for v in values):
+                                    valid = False
+                                else:
+                                    receipt_ids.update(values)
+                        valid = (valid and "engineering_delivery=PASS" in lines
+                                 and "acceptance=PENDING_FUTURE_EVIDENCE" in lines
+                                 and "engineering_delivery=FAIL" not in lines
+                                 and receipt_ids == set(ids))
+                except (OSError, ValueError, TypeError, AttributeError):
+                    valid = False
+            if not valid:
+                issues.append(f"{tid}: delivered_awaiting_evidence требует WAITING_EXTERNAL, полного списка req_id и ссылки на успешный delivery gate; активные дефекты нельзя парковать")
+            else:
+                parked = True
+                parked_delivery_tasks.append(tid)
         entries.append({"task_id": tid, "queue_position": pos, "priority": priority,
-                        "blocked_by": blockers, "status": str(row.get("status", ""))})
+                        "blocked_by": blockers, "status": str(row.get("status", "")),
+                        "execution_state": execution_state,
+                        "dispatch_disposition": "parked_evidence" if parked else "assess_runnable"})
     # Detect cycles between in-scope tasks; a queue position cannot rescue one.
     visiting: set[str] = set()
     visited: set[str] = set()
@@ -97,7 +156,8 @@ def audit_execution_queue(tasks: list[dict], project: Path | None = None) -> dic
         visit(task_id, [])
     entries.sort(key=lambda x: x["queue_position"] if type(x["queue_position"]) is int and x["queue_position"] > 0 else float("inf"))
     return {"complete": not issues, "open_tasks": len(open_rows),
-            "registered": len(positions), "issues": issues, "entries": entries}
+            "registered": len(positions), "issues": issues, "entries": entries,
+            "parked_delivery_tasks": parked_delivery_tasks}
 
 
 def optional_owner_check(row: dict) -> bool:

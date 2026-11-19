@@ -54,7 +54,7 @@ Python gets AST symbols/references/imports/tests. JS/TS/Go/Rust/Java get lightwe
 
 ## Coverage gate separate from navigation cache
 
-The tool `<OPENCODE_CONFIG>/tools/requirements_gate.py` in the workflow overlay is the **parent task acceptance gate** for non-trivial work, unlike the optional compact `manifest.json` navigation cache described below. The gate inventories source headings/list items, checks exact source hashes, mapping, evidence, review candidate, and deployed SHA. PM must manually add prose/screenshot/table constraints it cannot extract. Run at `plan`, `review --slice`, and `release` stages. See `WORKFLOW_PATCH_README.md` for exact commands. Never treat a green gate as independent proof of correct runtime behavior.
+The tool `<OPENCODE_CONFIG>/tools/requirements_gate.py` in the workflow overlay is the **parent task acceptance gate** for non-trivial work, unlike the optional compact `manifest.json` navigation cache described below. The gate inventories source headings/list items, checks exact source hashes, mapping, evidence, review candidate, and deployed SHA. PM must manually add prose/screenshot/table constraints it cannot extract. Run the applicable `plan`, `review`, `deploy`, `delivery` and `release` stages per `references/acceptance.md` (under this skill directory). Never treat a green gate as independent proof of correct runtime behavior.
 
 
 ## 3. Feature manifests
@@ -154,7 +154,7 @@ Put disposable probes/artifacts there. For parallel Builder lanes, prefer:
 
 `$OPENCODE_WORKFLOW_SCRATCH/lanes/<LANE_ID>/`
 
-Promote required evidence/source immediately after each individual check; close the tool-owned disposable run with `run-close` after true tool/browser/process completion and evidence promotion. At every completed task or feature handoff, perform scoped `unit-close` without waiting for the epic. After every project consumer is truly idle, `shared-scratch-close` can remove only known plugin-owned temporary `tmp/lanes/pycache` entries while preserving reusable indexes. `epic-close` remains a final residual sweep with confirmed safe ownership and no consumers. Never use age-based cleanup or clear arbitrary OS paths, active workspaces, shared caches in use, or durable proof. See global AGENTS.md and `tools/workflow_housekeeping.py` for exact commands.
+Promote required evidence/source immediately after each individual check; close the tool-owned disposable run with `run-close` after true tool/browser/process completion and evidence promotion. At every completed task or feature handoff, the owner performs scoped `unit-close` without waiting for the epic. After every project consumer is truly idle, `shared-scratch-close` can remove only known plugin-owned temporary `tmp/lanes/pycache` entries while preserving reusable indexes. `epic-close` remains a final residual sweep with confirmed safe ownership and no consumers. Never use age-based cleanup or clear arbitrary OS paths, active workspaces, shared caches in use, or durable proof. See global AGENTS.md and `tools/workflow_housekeeping.py` for exact commands.
 
 ## 7. Efficiency invariants
 

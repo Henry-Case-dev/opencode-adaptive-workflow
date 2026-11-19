@@ -156,7 +156,7 @@ test('v4.3: session listing unavailable cannot assert absence of active children
     delete h.ctx.session.list;
     await h.markRunning();h.setTime(120000);await h.ended();h.setTime(195000);
     await h.guard.check();assert.equal(h.admissions.length,0);
-    assert.ok(h.logs.some(x=>x.reason==='session-list-unavailable'));
+    assert.ok(h.logs.some(x=>x.reason==='child-roster-unverified'));
   }finally{await h.cleanup()}
 });
 test('v4.3: inventory failure, bad shape and partial pagination fail closed',async()=>{
@@ -337,5 +337,88 @@ test('v4.4: at most two continuation prompts if there is no changed task state',
     h.setTime(340000);await h.ended();h.setTime(440000);await h.guard.check();
     assert.equal(h.admissions.length,2);
     assert.ok(h.logs.some(l=>l.e==='paused-no-progress'));
+  }finally{await h.cleanup()}
+});
+
+// V4.5: role instructions, existing review and native continuation still hold.
+test('v4.5: real plugin host without session.list uses native idle roster, not guessed emptiness',async()=>{
+  const h=await harness();try{
+    delete h.ctx.session.list;
+    await h.markRunning();
+    await h.hooks['experimental.idle']({sessionID:'ses_root',background:[]});
+    h.setTime(120000);await h.ended();h.setTime(195000);
+    await h.guard.check();assert.equal(h.admissions.length,1);
+  }finally{await h.cleanup()}
+});
+test('v4.5: unknown native subagent identity is never misread as no child',async()=>{
+  const h=await harness();try{
+    delete h.ctx.session.list;
+    await h.markRunning();
+    await h.hooks['experimental.idle']({sessionID:'ses_root',background:[{kind:'subagent',sessionID:'ses_root'}]});
+    h.setTime(120000);await h.ended();h.setTime(195000);
+    await h.guard.check();assert.equal(h.admissions.length,0);
+    assert.ok(h.logs.some(x=>x.reason==='child-roster-unverified'));
+  }finally{await h.cleanup()}
+});
+test('v4.5: native child completion with lost parent notice can resume root once',async()=>{
+  let busy=true;
+  const h=await harness({statusText:status.replace('Next execution: runnable','Next execution: awaiting_children'),
+    waitFn:async({sessionID})=>{if(sessionID==='ses_child'&&busy)throw new Error('child busy')}});
+  try{
+    delete h.ctx.session.list;
+    const orig=h.ctx.session.get;
+    h.ctx.session.get=async args=>args.sessionID==='ses_child'?
+      {id:'ses_child',parentID:'ses_root'}:orig(args);
+    await h.markRunning();
+    await h.guard.onEvent({type:'session.created',properties:{info:{id:'ses_child',parentID:'ses_root'}}});
+    await h.guard.onEvent({type:'session.execution.started',properties:{sessionID:'ses_child'}});
+    await h.hooks['experimental.idle']({sessionID:'ses_root',background:[{kind:'subagent',childID:'ses_child'}]});
+    h.setTime(120000);await h.ended();h.setTime(195000);
+    await h.guard.check();assert.equal(h.admissions.length,0);
+    busy=false;
+    await h.guard.onEvent({type:'session.execution.succeeded',properties:{sessionID:'ses_child'}});
+    await h.guard.check();assert.equal(h.admissions.length,1);
+    await h.guard.check();assert.equal(h.admissions.length,1);
+    assert.equal(h.guard.getState().childSessions.ses_child.state,'succeeded');
+  }finally{await h.cleanup()}
+});
+test('v4.5: child native status unavailable must remain unknown even with recorded child',async()=>{
+  const h=await harness({waitFn:async({sessionID})=>{if(sessionID==='ses_child')throw new Error('backend unavailable')}});
+  try{
+    delete h.ctx.session.list;
+    await h.markRunning();
+    await h.guard.onEvent({type:'session.created',properties:{info:{id:'ses_child',parentID:'ses_root'}}});
+    await h.hooks['experimental.idle']({sessionID:'ses_root',background:[]});
+    h.setTime(120000);await h.ended();h.setTime(195000);
+    await h.guard.check();assert.equal(h.admissions.length,0);
+    assert.ok(h.logs.some(x=>x.reason==='child-still-running-or-unknown'));
+  }finally{await h.cleanup()}
+});
+
+test('v4.5: persisted child identity survives restart but coverage becomes unknown',async()=>{
+  const h=await harness();try{
+    await h.markRunning();
+    await h.guard.onEvent({type:'session.created',properties:{info:{id:'ses_child',parentID:'ses_root'}}});
+    assert.equal(h.guard.getState().childSessions.ses_child.state,'observed');
+    await h.dispose();
+    const next=await startGuard(h.ctx,{pluginDir:path.join(h.repo,'guard'),
+      logger:async()=>{},now:()=>200000,setIntervalFn:()=>0,clearIntervalFn:()=>{}});
+    const dispose=await next.init();try{
+      assert.equal(next.getState().childSessions.ses_child.state,'observed');
+      assert.equal(next.getState().childCoverage,false);
+      assert.equal(next.getState().lastSucceededAt,0);
+      await next.check();assert.equal(h.admissions.length,0);
+    }finally{await dispose()}
+  }finally{await fs.rm(h.repo,{recursive:true,force:true})}
+});
+
+test('v4.5: active native shell cannot be mistaken for quiescent child roster',async()=>{
+  const h=await harness();try{
+    delete h.ctx.session.list;
+    await h.markRunning();
+    await h.hooks['experimental.idle']({sessionID:'ses_root',background:[{kind:'shell',id:'job_shell'}]});
+    h.setTime(120000);await h.ended();h.setTime(195000);
+    await h.guard.check();assert.equal(h.admissions.length,0);
+    assert.ok(h.logs.some(x=>x.reason==='child-roster-unverified'));
   }finally{await h.cleanup()}
 });

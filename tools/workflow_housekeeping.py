@@ -29,6 +29,7 @@ from pathlib import Path
 import re
 import secrets
 import shutil
+import stat
 import subprocess
 import sys
 
@@ -84,6 +85,7 @@ def git(repo, *args, check=False):
 
 def read_marker(path):
     try:
+        if is_redirect(path / MARK): return None
         return json.loads((path / MARK).read_text(encoding='utf8'))
     except (OSError, ValueError):
         return None
@@ -96,11 +98,29 @@ def atomic_json(file, data):
     tmp.replace(file)
 
 
-def managed_safe(path):
-    if path.is_symlink() or not path.is_dir():
+def is_redirect(path):
+    """Reject symlinks and Windows junctions/reparse points, including ancestors."""
+    try:
+        info = Path(path).lstat()
+        return stat.S_ISLNK(info.st_mode) or bool(getattr(info, 'st_file_attributes', 0) & getattr(stat, 'FILE_ATTRIBUTE_REPARSE_POINT', 0x400))
+    except OSError:
         return False
-    for parent, dirs, files in os.walk(path, followlinks=False):
-        if any(Path(parent, x).is_symlink() for x in dirs + files):
+
+
+def safe_chain(path, stop):
+    path, stop = Path(path).absolute(), Path(stop).absolute()
+    if path != stop and stop not in path.parents:
+        return False
+    return not any(is_redirect(p) for p in (path, *path.parents) if p == stop or stop in p.parents)
+
+
+def managed_safe(path):
+    if is_redirect(path) or not path.is_dir():
+        return False
+    def fail_walk(error):
+        raise error
+    for parent, dirs, files in os.walk(path, followlinks=False, onerror=fail_walk):
+        if any(is_redirect(Path(parent, x)) for x in dirs + files):
             return False
         if any(x.lower() in PROTECTED_NAMES for x in dirs + files):
             return False
@@ -229,10 +249,10 @@ def inspect_worktree(repo, wt):
     registered=listed_worktrees(repo)
     if canonical(wt) == canonical(repo): return 'main worktree'
     if str(wt) not in registered: return 'not registered with Git'
-    if wt.is_symlink() or not is_inside(wt,ROOT/'worktrees'): return 'unsafe path'
+    if not safe_chain(wt, ROOT) or not is_inside(wt,ROOT/'worktrees'): return 'unsafe path'
     if process_uses(wt): return 'active process is using this directory'
-    status=git(wt,'status','--porcelain=v1','--untracked-files=all',check=True)
-    if status.stdout.strip(): return 'uncommitted or untracked files'
+    status=git(wt,'status','--porcelain=v1','--untracked-files=all','--ignored=matching',check=True)
+    if status.stdout.strip(): return 'uncommitted, untracked or ignored files; dispose only proven agent-generated files first'
     head=git(wt,'rev-parse','HEAD',check=True).stdout.strip()
     symbolic=git(wt,'symbolic-ref','-q','HEAD')
     if symbolic.returncode and git(repo,'merge-base','--is-ancestor',head,'HEAD').returncode:
@@ -249,7 +269,7 @@ def run_reason(repo, epic, folder, unit=None):
     valid_parents = [ROOT / part / project_id(repo) / epic_id(epic) for part in ('runs', 'temp')]
     # Use lexical parent check as well as resolved containment: a symlink anywhere
     # in the parent chain must never redirect cleanup outside managed storage.
-    if folder.is_symlink() or not any(folder.parent == parent for parent in valid_parents):
+    if not safe_chain(folder, ROOT) or not any(folder.parent == parent for parent in valid_parents):
         return 'outside the exact managed run scope or symlink'
     if not folder.is_dir() or not any(is_inside(folder, parent) for parent in valid_parents):
         return 'missing, redirected or unsafe path'
@@ -295,6 +315,122 @@ def run_close(args):
     # Never rely on an arbitrary caller-supplied label or folder marker alone.
     deleted, skipped = dispose_run(repo, args.epic, folder, args.apply)
     print(f'Run close: removed={deleted}; retained={skipped}; mode=' + ('APPLY' if args.apply else 'DRY-RUN'))
+    if args.apply and skipped:
+        return 3
+    return 0
+
+
+def unit_items(repo, epic, unit):
+    """Enumerate only exact, positively registered unit ownership; no deep scan."""
+    for part in ('runs', 'temp'):
+        epic_path = ROOT / part / project_id(repo) / epic_id(epic)
+        if not safe_chain(epic_path, ROOT):
+            raise RuntimeError('redirected unit scope: '+str(epic_path))
+        if not epic_path.is_dir():
+            continue
+        for folder in sorted(epic_path.iterdir()):
+            if is_redirect(folder):
+                # Ownership cannot be safely read through a redirect. Do not
+                # certify this epic scope clean while it is unresolved.
+                raise RuntimeError('redirected run in unit scope: '+str(folder))
+            if not folder.is_dir(): continue
+            marker = read_marker(folder)
+            if isinstance(marker, dict) and marker.get('unit') == unit:
+                yield ('run', folder, None)
+    registry = ROOT/'registry'/'worktrees'
+    if not safe_chain(registry, ROOT): raise RuntimeError('redirected worktree registry')
+    if registry.is_dir():
+        for file in sorted(registry.glob('*.json')):
+            if is_redirect(file):
+                raise RuntimeError('redirected worktree registration: '+str(file))
+            try: record=json.loads(file.read_text(encoding='utf8'))
+            except (OSError, ValueError): continue
+            if (record.get('schema') == 2 and record.get('repo') == str(repo) and
+                record.get('epic') == epic and record.get('unit') == unit):
+                yield ('worktree', Path(record['path']), file)
+
+
+def retention_records(args):
+    """Optional explicit retention in an existing durable JSON handoff.
+
+    This is accountability, not proof that a path is idle or safe to delete.
+    Only exact paths with owner, reason, evidence and next event count.
+    """
+    if not getattr(args, 'retention_file', None):
+        return {}
+    raw = json.loads(Path(args.retention_file).read_text(encoding='utf8'))
+    rows = raw.get('cleanup_retained', []) if isinstance(raw, dict) else raw
+    if not isinstance(rows, list):
+        raise ValueError('cleanup_retained must be an array')
+    result = {}
+    for row in rows:
+        if not isinstance(row, dict) or not all(isinstance(row.get(k), str) and row[k].strip() for k in ('path','owner','reason','evidence','next_event')):
+            raise ValueError('retention requires path, owner, reason, evidence, next_event')
+        key = os.path.normcase(str(Path(row['path']).absolute()))
+        if key in result: raise ValueError('duplicate retained path')
+        result[key] = row
+    return result
+
+
+def unit_check(args):
+    """Independent, read-only verification at ordinary handoff.
+
+    Empty inventory is only scoped evidence; legacy/unmanaged paths must still
+    be reconciled by their creator. Retained paths require exact disposition.
+    """
+    repo = canonical(args.repo)
+    retained = retention_records(args)
+    remaining = []
+    for kind, path, record in unit_items(repo, args.epic, args.unit):
+        key = os.path.normcase(str(path.absolute()))
+        remaining.append({'kind':kind,'path':str(path),'disposition':retained.get(key)})
+    missing = [r for r in remaining if not r['disposition']]
+    output = {'repo':str(repo),'epic':args.epic,'unit':args.unit,
+              'cleanup_complete':not remaining,'handoff_accounted':not missing,
+              'remaining':remaining,'unaccounted_count':len(missing)}
+    print(json.dumps(output, ensure_ascii=False, indent=2))
+    return 3 if missing else 0
+
+
+def retire_worktree_aux(repo, wt, registry, apply):
+    """Retire only plugin-owned scratch/index for this exact removed checkout.
+
+    A registry is retained if the scratch cannot be safely disposed. Never
+    use a marker for the main repo or a different checkout to delete data.
+    """
+    if not safe_chain(wt, ROOT) or not is_inside(wt, ROOT/'worktrees'):
+        return False, 'unsafe registered worktree path'
+    if wt.exists() or str(canonical(wt)) in listed_worktrees(repo):
+        return False, 'worktree still present'
+    if process_uses(wt): return False, 'worktree path still used by process'
+    key = wt.name + '-' + hashlib.sha1(str(wt).encode('utf8')).hexdigest()[:12]
+    for part, marker_name in (('temp','.opencode-workflow-scratch.json'),('cache','.opencode-repo-cache.json')):
+        base=ROOT/part/'intelligence'; folder=base/key
+        if not folder.exists() and not is_redirect(folder): continue
+        if not safe_chain(folder, ROOT) or not folder.is_dir() or not is_inside(folder,base):
+            return False, 'unsafe auxiliary path: '+str(folder)
+        try:
+            marker=folder/marker_name
+            if is_redirect(marker): raise ValueError('redirected marker')
+            proof=json.loads(marker.read_text(encoding='utf8'))
+        except (ValueError,OSError): return False, 'unowned auxiliary folder: '+str(folder)
+        if proof.get('managedBy')!='opencode-global-intelligence-v3' or proof.get('repo')!=str(wt):
+            return False, 'ownership mismatch: '+str(folder)
+        if part=='temp':
+            known={marker_name,'tmp','lanes','pycache'}
+            if any(p.name not in known or is_redirect(p) for p in folder.iterdir()) or not managed_safe(folder):
+                return False, 'protected or unknown scratch contents: '+str(folder)
+        else:
+            known={marker_name,'repo-intel.sqlite3','repo-intel.sqlite3-wal','repo-intel.sqlite3-shm'}
+            if proof.get('schema')!=1 or any(p.name not in known or is_redirect(p) or not p.is_file() for p in folder.iterdir()):
+                return False, 'protected or unknown cache contents: '+str(folder)
+        if process_uses(folder): return False, 'auxiliary path in use: '+str(folder)
+        if apply:
+            try: shutil.rmtree(folder)
+            except OSError as exc: return False, 'auxiliary cleanup failed: '+str(exc)
+            print('DELETED retired worktree auxiliary:',folder)
+    if apply: registry.unlink()
+    return True, ''
 
 
 def unit_close(args):
@@ -302,44 +438,105 @@ def unit_close(args):
     verified_cleanup_flags(args)
     repo = canonical(args.repo)
     deleted = skipped = 0
-    for part in ('runs', 'temp'):
-        epic_path = ROOT / part / project_id(repo) / epic_id(args.epic)
-        if not epic_path.is_dir() or epic_path.is_symlink():
-            continue
-        for folder in sorted(epic_path.iterdir()):
-            marker = read_marker(folder) if folder.is_dir() and not folder.is_symlink() else None
-            # Untagged legacy runs and other units are not candidates for a unit close.
-            if not isinstance(marker, dict) or marker.get('unit') != args.unit:
-                continue
-            d, k = dispose_run(repo, args.epic, folder, args.apply, unit=args.unit)
+    retained = retention_records(args)
+    for kind, target, file in list(unit_items(repo, args.epic, args.unit)):
+        key = os.path.normcase(str(target.absolute()))
+        if key in retained:
+            print('KEEP explicitly retained:', target, '-', retained[key]['reason']); skipped += 1; continue
+        if kind == 'run':
+            d, k = dispose_run(repo, args.epic, target, args.apply, unit=args.unit)
             deleted += d; skipped += k
-        if args.apply and epic_path.exists() and not any(epic_path.iterdir()):
-            epic_path.rmdir()
-    registry = ROOT/'registry'/'worktrees'
-    if registry.exists():
-        for file in sorted(registry.glob('*.json')):
-            try: record = json.loads(file.read_text(encoding='utf8'))
-            except (OSError, ValueError): continue
-            if (record.get('schema') != 2 or record.get('repo') != str(repo) or
-                record.get('epic') != args.epic or record.get('unit') != args.unit):
-                continue
-            wt = canonical(record.get('path', ''))
-            try: reason = inspect_worktree(repo, wt)
-            except RuntimeError as exc: reason = str(exc)
-            if reason:
-                print('KEEP worktree:', wt, '-', reason); skipped += 1; continue
-            if args.apply:
-                result = git(repo, 'worktree', 'remove', str(wt))
-                if result.returncode:
-                    print('KEEP worktree (git refused):', wt, result.stderr.strip())
-                    skipped += 1; continue
-                file.unlink()
-                print('REMOVED integrated task worktree:', wt)
-                deleted += 1
-            else:
-                print('WOULD REMOVE integrated task worktree:', wt)
+            continue
+        wt = target
+        # A prior close may have retired the checkout but left protected/locked
+        # auxiliary files. Keep the registry until their disposition is settled.
+        if not wt.exists() and not is_redirect(wt):
+            ok, why = retire_worktree_aux(repo, wt, file, args.apply)
+            if ok: deleted += int(args.apply)
+            else: print('KEEP retired worktree registration:',wt,'-',why); skipped += 1
+            continue
+        try: reason = inspect_worktree(repo, wt)
+        except (RuntimeError, OSError) as exc: reason = str(exc)
+        if reason:
+            print('KEEP worktree:', wt, '-', reason); skipped += 1; continue
+        if args.apply:
+            result = git(repo, 'worktree', 'remove', str(wt))
+            if result.returncode:
+                print('KEEP worktree (git refused):', wt, result.stderr.strip())
+                skipped += 1; continue
+            print('REMOVED integrated task worktree:', wt)
+            deleted += 1
+            ok, why = retire_worktree_aux(repo, wt, file, True)
+            if not ok: print('KEEP retired worktree registration:',wt,'-',why); skipped += 1
+        else:
+            print('WOULD REMOVE integrated task worktree:', wt)
+    for part in ('runs','temp'):
+        parent = ROOT/part/project_id(repo)/epic_id(args.epic)
+        if args.apply and parent.is_dir() and safe_chain(parent, ROOT) and not any(parent.iterdir()):
+            parent.rmdir()
     print(f'Unit close: removed={deleted}; retained={skipped}; mode=' + ('APPLY' if args.apply else 'DRY-RUN'))
+    if args.apply:
+        return unit_check(args)
+    return 0
 
+
+def inventory(args):
+    """Read-only ownership inventory across ALL managed projects, not deletion.
+
+    Optional size scans are explicit and skip links; not a per-check full walk.
+    """
+    rows = []
+    def add(path, category, marker=None):
+        row = {'path':str(path),'category':category,'ownership':marker}
+        if args.sizes:
+            total = count = 0
+            if path.is_dir() and not is_redirect(path):
+                for parent, dirs, files in os.walk(path, followlinks=False):
+                    dirs[:] = [x for x in dirs if not is_redirect(Path(parent,x))]
+                    for name in files:
+                        f = Path(parent,name)
+                        try:
+                            if not is_redirect(f): total += f.stat().st_size; count += 1
+                        except OSError: pass
+            row.update(bytes=total, files=count)
+        rows.append(row)
+    for part in ('runs','temp','worktrees','cache','backups','reports','quarantine'):
+        base=ROOT/part
+        if not base.is_dir() or not safe_chain(base,ROOT): continue
+        for child in sorted(base.iterdir()):
+            if is_redirect(child):
+                add(child,'redirect_keep'); continue
+            if part in ('runs','temp') and child.name != 'intelligence' and child.is_dir():
+                for epic in sorted(child.iterdir()):
+                    if not epic.is_dir() or is_redirect(epic):
+                        add(epic,'unknown_keep'); continue
+                    for run in sorted(epic.iterdir()):
+                        marker=read_marker(run) if run.is_dir() and not is_redirect(run) else None
+                        add(run,'managed_run' if marker else 'unknown_keep',marker)
+            elif part=='worktrees' and child.is_dir():
+                for wt in sorted(child.iterdir()):
+                    marker=None
+                    if not is_redirect(wt):
+                        try: marker=json.loads(registry_file(wt).read_text(encoding='utf8'))
+                        except (OSError,ValueError): pass
+                    add(wt,'registered_worktree' if marker else 'unknown_keep',marker)
+            elif part in ('cache','temp') and child.name=='intelligence' and child.is_dir():
+                for folder in sorted(child.iterdir()):
+                    marker=None
+                    if not is_redirect(folder):
+                        try: marker=json.loads((folder/('.opencode-repo-cache.json' if part=='cache' else '.opencode-workflow-scratch.json')).read_text(encoding='utf8'))
+                        except (OSError,ValueError): pass
+                    add(folder,'intelligence_'+part if marker else 'unknown_keep',marker)
+            else: add(child,'inspect_only')
+    if ROOT.is_dir() and not is_redirect(ROOT):
+        known={'runs','temp','worktrees','cache','backups','reports','quarantine','registry'}
+        for child in sorted(ROOT.iterdir()):
+            if child.name not in known: add(child,'unknown_keep')
+    for name in ('OpenCodeScratch','OpenCodeCache'):
+        p=CONFIG/name
+        if p.exists(): add(p,'legacy_inspect_only')
+    if args.sizes: rows.sort(key=lambda x:x.get('bytes',0),reverse=True)
+    print(json.dumps({'workspace':str(ROOT),'free_bytes':shutil.disk_usage(ROOT if ROOT.exists() else CONFIG).free,'items':rows},ensure_ascii=False,indent=2))
 
 def shared_scratch_close(args):
     """Remove plugin-owned *temporary* shared areas only when all project consumers are idle.
@@ -354,7 +551,7 @@ def shared_scratch_close(args):
     key = repo.name + '-' + _hashlib.sha1(str(repo).encode('utf8')).hexdigest()[:12]
     base = ROOT/'temp'/'intelligence'
     folder = base/key
-    if folder.is_symlink() or not folder.is_dir() or not is_inside(folder, base):
+    if not safe_chain(folder, ROOT) or not folder.is_dir() or not is_inside(folder, base):
         print('KEEP shared scratch: no safe managed folder')
         return
     try: proof = json.loads((folder/'.opencode-workflow-scratch.json').read_text(encoding='utf8'))
@@ -368,7 +565,7 @@ def shared_scratch_close(args):
     for name in ('tmp', 'lanes', 'pycache'):
         sub = folder/name
         if not sub.exists() and not sub.is_symlink(): continue
-        if not is_inside(sub, folder) or not managed_safe(sub):
+        if not safe_chain(sub, ROOT) or not is_inside(sub, folder) or not managed_safe(sub):
             print('KEEP shared scratch child:', sub, '- protected or unsafe')
             skipped += 1;continue
         if args.apply:
@@ -390,7 +587,7 @@ def epic_close(args):
         if not epic_path.exists():
             continue
         for folder in sorted(epic_path.iterdir()):
-            if not is_inside(folder, parent) or folder.is_symlink():
+            if not safe_chain(folder, ROOT) or not is_inside(folder, parent):
                 print('SKIP unsafe:',folder); skipped+=1; continue
             d, k = dispose_run(repo, args.epic, folder, args.apply)
             deleted += d; skipped += k
@@ -402,7 +599,11 @@ def epic_close(args):
             try: record=json.loads(file.read_text(encoding='utf8'))
             except (ValueError,OSError): continue
             if record.get('schema')!=2 or record.get('repo')!=str(repo) or record.get('epic')!=args.epic:continue
-            wt=canonical(record.get('path',''))
+            wt=Path(record.get('path',''))
+            if not wt.exists() and not is_redirect(wt):
+                ok,why=retire_worktree_aux(repo,wt,file,args.apply)
+                if not ok: print('KEEP retired worktree registration:',wt,'-',why); skipped+=1
+                continue
             try: reason=inspect_worktree(repo,wt)
             except RuntimeError as e: reason=str(e)
             if reason:
@@ -412,8 +613,9 @@ def epic_close(args):
                 result=git(repo,'worktree','remove',str(wt))
                 if result.returncode:
                     print('KEEP worktree (git refused):',wt, result.stderr.strip()); skipped+=1;continue
-                file.unlink()
                 print('REMOVED clean integrated worktree:',wt);deleted+=1
+                ok,why=retire_worktree_aux(repo,wt,file,True)
+                if not ok: print('KEEP retired worktree registration:',wt,'-',why); skipped+=1
             else:
                 print('WOULD REMOVE clean integrated worktree:',wt)
     if args.purge_disposable_cache:
@@ -425,20 +627,20 @@ def epic_close(args):
                 try: proof=json.loads(m.read_text(encoding='utf8'))
                 except (OSError,ValueError):continue
                 if str(canonical(proof.get('repo',''))) != str(repo) or proof.get('managedBy')!='opencode-global-intelligence-v3':continue
-                if not is_inside(folder,scratch) or not managed_safe(folder):
+                if not safe_chain(folder, ROOT) or not is_inside(folder,scratch) or not managed_safe(folder):
                     print('KEEP intelligence scratch (protected):',folder);skipped+=1;continue
                 if args.apply:shutil.rmtree(folder);deleted+=1;print('DELETED intelligence scratch:',folder)
                 else:print('WOULD DELETE intelligence scratch:',folder)
         cache=ROOT/'cache'/'intelligence'
         if cache.exists():
             for folder in cache.iterdir():
-                if not folder.is_dir() or folder.is_symlink() or not is_inside(folder,cache): continue
+                if not folder.is_dir() or not safe_chain(folder, ROOT) or not is_inside(folder,cache): continue
                 marker=folder/'.opencode-repo-cache.json'
                 try: proof=json.loads(marker.read_text(encoding='utf8'))
                 except (ValueError,OSError): continue
                 if proof.get('schema')!=1 or proof.get('managedBy')!='opencode-global-intelligence-v3' or str(canonical(proof.get('repo',''))) != str(repo):continue
                 known={'.opencode-repo-cache.json','repo-intel.sqlite3','repo-intel.sqlite3-wal','repo-intel.sqlite3-shm'}
-                if any(p.name not in known or p.is_symlink() or p.is_dir() for p in folder.iterdir()):
+                if any(p.name not in known or is_redirect(p) or p.is_dir() for p in folder.iterdir()):
                     print('KEEP index cache (unknown contents):',folder);skipped+=1;continue
                 if args.apply:
                     try:shutil.rmtree(folder);deleted+=1;print('DELETED disposable repo index:',folder)
@@ -478,11 +680,15 @@ def main():
         a.add_argument('--repo',required=True)
         a.add_argument('--epic',required=True)
         if command == 'run-close': a.add_argument('--path',required=True)
-        else: a.add_argument('--unit',required=True)
+        else:
+            a.add_argument('--unit',required=True)
+            a.add_argument('--retention-file')
         a.add_argument('--confirmed-idle',action='store_true')
         a.add_argument('--confirmed-evidence',action='store_true')
         a.add_argument('--apply',action='store_true')
         a.set_defaults(action=action)
+    a=sub.add_parser('unit-check');a.add_argument('--repo',required=True);a.add_argument('--epic',required=True);a.add_argument('--unit',required=True);a.add_argument('--retention-file');a.set_defaults(action=unit_check)
+    a=sub.add_parser('inventory');a.add_argument('--sizes',action='store_true');a.set_defaults(action=inventory)
     a=sub.add_parser('shared-scratch-close')
     a.add_argument('--repo',required=True)
     a.add_argument('--confirmed-project-idle',action='store_true')
@@ -492,8 +698,8 @@ def main():
     a=sub.add_parser('epic-close');a.add_argument('--repo',required=True);a.add_argument('--epic',required=True);a.add_argument('--apply',action='store_true');a.add_argument('--confirmed-complete',action='store_true');a.add_argument('--confirmed-idle',action='store_true');a.add_argument('--purge-disposable-cache',action='store_true');a.set_defaults(action=epic_close)
     a=sub.add_parser('audit');a.add_argument('--repo',required=True);a.set_defaults(action=audit)
     args=ap.parse_args()
-    try:args.action(args)
+    try:return args.action(args) or 0
     except (OSError,RuntimeError,ValueError) as exc:
         ap.exit(2, f'ERROR: {exc}\n')
 
-if __name__=='__main__':main()
+if __name__=='__main__':sys.exit(main())

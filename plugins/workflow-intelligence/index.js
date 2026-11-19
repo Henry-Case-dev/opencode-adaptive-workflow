@@ -12,7 +12,9 @@ const initializedScratch = new Set()
 
 // Single portable storage root: derived from the installed global plugin location.
 // Never derive workflow files from the current repository's parent or system temp.
-const workspace = path.resolve(here, "..", "..", "WorkspaceData")
+const workspace = process.env.OPENCODE_WORKSPACE_DATA?.trim()
+  ? path.resolve(process.env.OPENCODE_WORKSPACE_DATA.trim())
+  : path.resolve(here, "..", "..", "WorkspaceData")
 function scratchBase() { return path.join(workspace, "temp", "intelligence") }
 function cacheBase() { return path.join(workspace, "cache", "intelligence") }
 
