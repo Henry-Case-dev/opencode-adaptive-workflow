@@ -23,7 +23,62 @@ TASK_STATES = {"PENDING", "BUILDING", "REVIEW", "READY_FOR_LIVE", "WAITING_EXTER
 KNOWN_STATES = {"PENDING", "BUILDING", "REVIEW", "VERIFIED", "FAILED", "BLOCKED_REAL_HUMAN_GATE", "READY_FOR_LIVE"}
 
 
-def audit_execution_queue(tasks: list[dict], project: Path | None = None) -> dict:
+class SnapshotReads:
+    """One invocation only: parse each file and hash each source once.
+
+    No disk cache or cross-run reuse. A changed file invalidates the snapshot,
+    rather than silently returning an old denominator or skipping a gate.
+    """
+    def __init__(self):
+        self.bytes = {}
+        self.objects = {}
+        self.hashes = {}
+        self.stamps = {}
+
+    @staticmethod
+    def stamp(p: Path):
+        st = p.stat()
+        return (st.st_size, st.st_mtime_ns, st.st_ctime_ns, st.st_ino)
+
+    def read(self, p: Path) -> bytes:
+        p = p.resolve()
+        if p not in self.bytes:
+            before = self.stamp(p)
+            data = p.read_bytes()
+            after = self.stamp(p)
+            if before != after:
+                raise ValueError(f"файл изменился во время подсчёта: {p}")
+            self.bytes[p] = data
+            self.stamps[p] = after
+        return self.bytes[p]
+
+    def text(self, p: Path) -> str:
+        return self.read(p).decode("utf-8-sig")
+
+    def json(self, p: Path):
+        p = p.resolve()
+        if p not in self.objects:
+            self.objects[p] = json.loads(self.text(p))
+        return self.objects[p]
+
+    def sha(self, p: Path) -> str:
+        p = p.resolve()
+        if p not in self.hashes:
+            self.hashes[p] = hashlib.sha256(self.read(p)).hexdigest().lower()
+        return self.hashes[p]
+
+    def changed(self):
+        for p, stamp in self.stamps.items():
+            try:
+                if self.stamp(p) != stamp:
+                    return str(p)
+            except OSError:
+                return str(p)
+        return None
+
+
+def audit_execution_queue(tasks: list[dict], project: Path | None = None,
+                          reads: SnapshotReads | None = None) -> dict:
     """Read-only structural guard for the *existing* tasks[] execution queue.
 
     Mapping, queue admission and execution are distinct states. Never infer a
@@ -97,7 +152,7 @@ def audit_execution_queue(tasks: list[dict], project: Path | None = None) -> dic
                     if not maps:
                         valid = False
                     for path in maps:
-                        data = json.loads(_project_path(path, project).read_text(encoding="utf-8-sig"))
+                        data = reads.json(_project_path(path, project)) if reads else json.loads(_project_path(path, project).read_text(encoding="utf-8-sig"))
                         for req in data.get("items", []) + data.get("additional_requirements", []):
                             if req.get("disposition") != "required" or optional_owner_check(req) or req.get("status") == "VERIFIED":
                                 continue
@@ -113,7 +168,7 @@ def audit_execution_queue(tasks: list[dict], project: Path | None = None) -> dic
                     if valid:
                         # This checks the durable receipt, not the remote deployment.
                         # The actual delivery gate must have run at handoff.
-                        lines = receipt.read_text(encoding="utf-8-sig").splitlines()
+                        lines = (reads.text(receipt) if reads else receipt.read_text(encoding="utf-8-sig")).splitlines()
                         receipt_ids = set()
                         for line in lines:
                             if line.startswith("deferred_req_ids="):
@@ -165,7 +220,9 @@ def optional_owner_check(row: dict) -> bool:
 
 
 
-def _load_maps(paths: list[str], namespaces: dict[Path, str] | None = None, project: Path | None = None) -> dict:
+def _load_maps(paths: list[str], namespaces: dict[Path, str] | None = None, project: Path | None = None,
+               reads: SnapshotReads | None = None) -> dict:
+    reads = reads or SnapshotReads()
     statuses: dict[tuple[str, str], str] = {}
     owners: dict[str, set[tuple[str, str]]] = defaultdict(set)
     duplicates = 0
@@ -181,7 +238,7 @@ def _load_maps(paths: list[str], namespaces: dict[Path, str] | None = None, proj
         if not p.is_file():
             raise ValueError(f"карта не найдена: {p}")
         try:
-            data = json.loads(p.read_text(encoding="utf-8-sig"))
+            data = reads.json(p)
         except (UnicodeError, json.JSONDecodeError) as exc:
             raise ValueError(f"карта не читается: {p}: {exc}") from exc
         if data.get("schema") != SCHEMA:
@@ -236,10 +293,13 @@ def _load_maps(paths: list[str], namespaces: dict[Path, str] | None = None, proj
             owners[owner_key].add(key)
     # Reference integrity for all optional rows, including across two maps of one epic:
     # only listed engineering requirements can justify treating feedback as optional.
+    engineering_by_map = defaultdict(set)
+    for map_path, rid in statuses:
+        engineering_by_map[map_path].add(rid)
     for raw_path in ordered_paths:
         p = Path(raw_path)
-        map_engineering_rids = {key[1] for key in statuses if key[0] == str(p)}
-        data = json.loads(p.read_text(encoding="utf-8-sig"))
+        map_engineering_rids = engineering_by_map[str(p)]
+        data = reads.json(p)
         for row in data.get("items", []) + data.get("additional_requirements", []):
             if row.get("disposition") == "required" and optional_owner_check(row):
                 if not all(isinstance(x, str) and x in map_engineering_rids
@@ -281,13 +341,13 @@ def _project_path(raw: str, project: Path) -> Path:
     return (path if path.is_absolute() else project / path).resolve()
 
 
-def source_sections(source: Path, level: int | None = None) -> tuple[int, list[dict]]:
+def source_sections(source: Path, level: int | None = None, reads: SnapshotReads | None = None) -> tuple[int, list[dict]]:
     """Top-level Markdown sections, stable by heading text + duplicate ordinal.
 
     Ignore headings in fenced code. A single document-title heading is skipped in
     favor of the next level when the document has many second-level sections.
     """
-    lines = source.read_text(encoding="utf-8-sig").splitlines()
+    lines = (reads.text(source) if reads else source.read_text(encoding="utf-8-sig")).splitlines()
     headings = []
     fence_char, fence_len = None, 0
     for number, line in enumerate(lines, 1):
@@ -344,7 +404,7 @@ def inventory_template(source: Path, project: Path, level: int | None = None) ->
 
 
 def audit_source_inventory(scope: dict, scope_path: Path, task_by_id: dict,
-                           inputs_by_id: dict, stale: list[str]) -> dict:
+                           inputs_by_id: dict, stale: list[str], reads: SnapshotReads | None = None) -> dict:
     """Bidirectional check of all source sections and their explicit dispositions.
 
     No automatic task creation, completion, status adjustment or overwrite.
@@ -371,7 +431,7 @@ def audit_source_inventory(scope: dict, scope_path: Path, task_by_id: dict,
     if default_source.is_file() and source != default_source.resolve():
         stale.append("source_inventory не охватывает актуальный plans/current_task.md")
     try:
-        level, observed = source_sections(source, raw.get("heading_level"))
+        level, observed = source_sections(source, raw.get("heading_level"), reads)
     except (OSError, UnicodeError, ValueError) as exc:
         stale.append(f"source_inventory: не удалось прочитать исходный файл: {exc}")
         return {"total": 0, "accounted": 0, "unreviewed": [], "drift": []}
@@ -440,7 +500,7 @@ def audit_source_inventory(scope: dict, scope_path: Path, task_by_id: dict,
 
 
 def audit_input_links(raw_inputs: list[dict], tasks: list[dict], project: Path,
-                      stale: list[str]) -> None:
+                      stale: list[str], reads: SnapshotReads | None = None) -> None:
     """A boolean `reconciled` cannot substitute for source->requirement evidence.
 
     This is a structural check. PM still independently audits all clauses and the
@@ -481,7 +541,7 @@ def audit_input_links(raw_inputs: list[dict], tasks: list[dict], project: Path,
                 continue
             if pmap not in map_cache:
                 try:
-                    map_cache[pmap] = json.loads(pmap.read_text(encoding="utf-8-sig"))
+                    map_cache[pmap] = reads.json(pmap) if reads else json.loads(pmap.read_text(encoding="utf-8-sig"))
                 except (OSError, UnicodeError, json.JSONDecodeError):
                     map_cache[pmap] = None
             data = map_cache[pmap]
@@ -501,18 +561,19 @@ def audit_input_links(raw_inputs: list[dict], tasks: list[dict], project: Path,
                     stale.append(f"{iid}: нет доказанной связи с обязательными требованиями задачи {tid}")
 
 
-def _load_scope(scope_path: str, label: str) -> dict:
+def _load_scope(scope_path: str, label: str, reads: SnapshotReads | None = None) -> dict:
     """Explicit inventory of ALL in-scope owner requests, not just requirements maps.
 
     File paths are relative to the project cwd or absolute. The owner-created
     current_task.md remains read-only; root-input tasks require durable snapshots.
     A changed source checksum invalidates the previous percentage until reconciliation.
     """
+    reads = reads or SnapshotReads()
     path = Path(scope_path).resolve()
     if not path.is_file():
         raise ValueError(f"нет реестра задач: {path}")
     try:
-        root = json.loads(path.read_text(encoding="utf-8-sig"))
+        root = reads.json(path)
     except (OSError, UnicodeError, json.JSONDecodeError) as exc:
         raise ValueError(f"реестр не читается: {path}: {exc}") from exc
     if root.get("schema") != SCOPE_SCHEMA or not isinstance(root.get("tasks"), list):
@@ -549,7 +610,7 @@ def _load_scope(scope_path: str, label: str) -> dict:
             source = _project_path(sp, project)
             if not source.is_file():
                 stale.append(f"{iid}: потерян исходный текст/снимок ({sp})")
-            elif hashlib.sha256(source.read_bytes()).hexdigest().lower() != fp.lower():
+            elif reads.sha(source) != fp.lower():
                 stale.append(f"{iid}: исходный текст изменился после регистрации")
         if not row["reconciled"]:
             pending_inputs.append(iid)
@@ -582,7 +643,7 @@ def _load_scope(scope_path: str, label: str) -> dict:
             source = _project_path(sp, project)
             if not source.is_file():
                 stale.append(f"{tid}: исходный файл не найден ({sp})")
-            elif hashlib.sha256(source.read_bytes()).hexdigest().lower() != fingerprint.lower():
+            elif reads.sha(source) != fingerprint.lower():
                 stale.append(f"{tid}: исходное задание изменилось после последнего учёта")
         mp = row.get("maps", [])
         if not isinstance(mp, list) or not all(isinstance(x, str) and x.strip() for x in mp):
@@ -627,14 +688,14 @@ def _load_scope(scope_path: str, label: str) -> dict:
             stale.append(f"{tid}: задача помечена VERIFIED без завершённого учёта требований")
             continue
         try:
-            evidence = _load_maps(mapped_paths, project=project)
+            evidence = _load_maps(mapped_paths, project=project, reads=reads)
             if evidence["requirements"]["done"] != evidence["requirements"]["total"]:
                 stale.append(f"{tid}: задача VERIFIED, но в карте остались неподтверждённые требования")
         except ValueError as exc:
             stale.append(f"{tid}: ошибочная карта завершённой задачи: {exc}")
     project = path.parent.parent if path.parent.name == "plans" else path.parent
-    audit_input_links(raw_inputs, tasks, project, stale)
-    section_coverage = audit_source_inventory(root, path, {t["id"]: t for t in tasks}, input_by_id, stale)
+    audit_input_links(raw_inputs, tasks, project, stale, reads)
+    section_coverage = audit_source_inventory(root, path, {t["id"]: t for t in tasks}, input_by_id, stale, reads)
     # Statuses are not inferred from map completion. Flag candidates for evidence
     # reconciliation without auto-marking DONE or pausing unrelated workers.
     status_drift_candidates = []
@@ -642,12 +703,27 @@ def _load_scope(scope_path: str, label: str) -> dict:
         if task["status"] not in {"PENDING", "BUILDING", "REVIEW"} or not task.get("maps") or not task.get("coverage_complete"):
             continue
         try:
-            check = _load_maps(task["maps"], project=project)
+            check = _load_maps(task["maps"], project=project, reads=reads)
         except (ValueError, OSError):
             continue
         if check["requirements"]["done"] == check["requirements"]["total"]:
             status_drift_candidates.append(task["id"])
-    queue_audit = audit_execution_queue(tasks, project=project)
+    queue_audit = audit_execution_queue(tasks, project=project, reads=reads)
+    # Optional existing task-row annotations: read-only convergence signals.
+    # Missing records do not block a legacy workflow or imply approval.
+    try:
+        from workflow_convergence import audit_scope as audit_convergence_scope
+    except ModuleNotFoundError:
+        # The tests and some project harnesses load this script directly via
+        # importlib.spec_from_file_location, without tools/ on sys.path.
+        from importlib.util import module_from_spec, spec_from_file_location
+        spec = spec_from_file_location("workflow_convergence", Path(__file__).with_name("workflow_convergence.py"))
+        if spec is None or spec.loader is None:
+            raise ValueError("workflow_convergence.py unavailable beside workflow_progress.py")
+        mod = module_from_spec(spec)
+        spec.loader.exec_module(mod)
+        audit_convergence_scope = mod.audit_scope
+    convergence_audit = audit_convergence_scope(root, repo=project)
     # Always distinguish total owner requests from requirements/slices.
     snap = {
         "at_local": _clock(), "scope": label, "scope_file": str(path),
@@ -658,6 +734,7 @@ def _load_scope(scope_path: str, label: str) -> dict:
         "unmapped_tasks": uncovered, "stale_sources": stale,
         "source_coverage": section_coverage, "status_drift_candidates": status_drift_candidates,
         "execution_queue": queue_audit, "queue_registration_complete": queue_audit["complete"],
+        "convergence": convergence_audit,
         "measurable": not stale and not pending_inputs,
     }
     if pending_inputs:
@@ -668,7 +745,7 @@ def _load_scope(scope_path: str, label: str) -> dict:
                           "область задач или их подтверждения устарели; сначала сверить исходники, карты и статусы")
         return snap
     if map_paths:
-        snap.update(_load_maps(map_paths, namespaces=map_namespaces, project=project))
+        snap.update(_load_maps(map_paths, namespaces=map_namespaces, project=project, reads=reads))
     if uncovered:
         snap["requirements_measurable"] = False
         snap["requirements_reason"] = f"{len(uncovered)} задач ещё не перенесены полностью в карты требований"
@@ -697,7 +774,13 @@ def _stat(done: int, total: int, width: int = 20) -> str:
 def snapshot(paths: list[str], label: str, scope_file: str | None = None,
              require_queue: bool = False) -> dict:
     if scope_file:
-        snap = _load_scope(scope_file, label)
+        reads = SnapshotReads()
+        snap = _load_scope(scope_file, label, reads)
+        changed = reads.changed()
+        if changed:
+            snap["measurable"] = False
+            snap["reason"] = "файлы изменились во время подсчёта; нужен новый снимок"
+            snap.setdefault("stale_sources", []).append(changed)
         if require_queue and not snap["queue_registration_complete"]:
             snap["measurable"] = False
             queue_reason = "очередь исполнения не завершена: отсутствует позиция, приоритет или проверяемая зависимость"
@@ -705,8 +788,12 @@ def snapshot(paths: list[str], label: str, scope_file: str | None = None,
         return snap
     snap = {"at_local": _clock(), "scope": label}
     if paths:
-        snap.update(_load_maps(paths))
-        snap["measurable"] = True
+        reads = SnapshotReads()
+        snap.update(_load_maps(paths, reads=reads))
+        changed = reads.changed()
+        snap["measurable"] = not changed
+        if changed:
+            snap["reason"] = "файлы изменились во время подсчёта; нужен новый снимок"
     else:
         snap["measurable"] = False
         snap["reason"] = "не указаны карты/реестр активных задач; процент нельзя подтвердить"
@@ -715,6 +802,9 @@ def snapshot(paths: list[str], label: str, scope_file: str | None = None,
 
 def present(snap: dict) -> str:
     lines = [f"Время среды: {snap['at_local']}", f"Область: {snap['scope']}"]
+    if snap.get("convergence", {}).get("needs_arbiter"):
+        ids = [r["task_id"] for r in snap["convergence"]["needs_arbiter"]]
+        lines.append("Требуется Arbiter по подтверждённым повторным находкам: " + ", ".join(ids))
     if "execution_queue" in snap and not snap["execution_queue"]["complete"]:
         lines.append("Очередь исполнения: не подтверждена — " +
                      "; ".join(snap["execution_queue"]["issues"][:5]))

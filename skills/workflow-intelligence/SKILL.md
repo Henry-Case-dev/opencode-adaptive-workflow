@@ -134,7 +134,7 @@ Useful candidate classes:
 - mock-only tests that no longer protect a meaningful contract;
 - flaky tests treated by rerun instead of root-cause repair.
 
-Cleanup is Builder work and still passes Reviewer.
+Cleanup is Builder work and still passes Reviewer. It is due when the owned check/unit finishes, irrespective of free disk capacity; a project with hundreds of free gigabytes is not exempt.
 
 Mutation testing is targeted and optional. Use it only for a critical contract with suspiciously weak tests and only when the project already has a suitable runner or the dependency cost is explicitly justified.
 
@@ -163,3 +163,7 @@ Promote required evidence/source immediately after each individual check; close 
 - No broad scan after a valid targeted hit unless the task truly needs architecture-wide discovery.
 - No manifest/test audit/full suite just because the feature exists.
 - Reuse exact current evidence for an unchanged candidate/environment.
+
+
+## 8. Lean v3.5 reporting and execution
+Use `references/reporting.md` only for the communication contract or diagnosing its native integration. `workflow_report` is part of Continuation Guard; it is not `workflow_intel`, a new project database or an engineering gate. Existing progress checks parse/hash each source/map once per invocation and invalidate a detected concurrent change. At material transitions use one current snapshot; avoid rerunning solely for prose. Plan cohesive user-visible increments and read-only lookahead without new roles or duplicate source audits.

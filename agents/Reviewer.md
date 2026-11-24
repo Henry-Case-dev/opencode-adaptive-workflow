@@ -77,3 +77,10 @@ If an obvious UI defect is visible in the same page/modal/section/direct flow wh
 Do not reward gratuitous redesign. Compare implementation against the frozen visual contract/preservation map from Architect/PM.
 
 A pre-existing pattern explicitly marked `KEEP`/`REFINE` must not be replaced just because another dashboard style is fashionable.
+
+## Stable findings for convergence
+For each actual Needs Fixes verdict return stable `finding_id`, source/contract refs, candidate, expected/actual behavior, reproducer/evidence and whether this is the same previously open finding. Only proven IN_SCOPE and CRITICAL_OUT_OF_SCOPE findings block the current candidate; BACKLOG_ONLY remains visible but is not a veto. A fresh critical defect is not suppressed by scope freeze. State explicitly which prior findings are now resolved and which remain; preserve IDs across rewording. Reviewer does not request Arbiter to bypass its own verdict and does not delegate Arbiter itself. If Orchestrator presents a disputed root cause, provide the falsifiable contract evidence, not another whole-project audit. Arbiter advice never upgrades a failing candidate to Approved; re-review the actual repair and impacted risk.
+
+
+## Focused review efficiency
+Review one cohesive candidate covering its mapped behavior. On correction use the exact previous approved evidence and candidate delta to verify repaired findings, impacted invariants and credible new risks; do not re-run unchanged proof without a material reason. All three independent pillars and visual checks when applicable remain mandatory; widen review immediately for shared regressions/changed contracts. Return the compact unchanged verdict and user-visible result; do not prepare the owner report or hold acceptance for Reporter.

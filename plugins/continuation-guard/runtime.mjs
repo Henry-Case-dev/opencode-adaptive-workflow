@@ -1,5 +1,5 @@
 /**
- * OpenCode V2 continuation guard (v4.5). Opts in implicitly only through a real primary
+ * OpenCode V2 continuation guard (v4.7). Opts in implicitly only through a real primary
  * Orchestrator MODEL CONTEXT hook; NEVER parses user text or starts stale sessions.
  * Uses V2 session.execution.* lifecycle, not deprecated session.idle.
  */
@@ -9,14 +9,17 @@ import os from 'node:os';
 import crypto from 'node:crypto';
 import { normalizePath, evaluateWork, sessionMatches, eventSessionId, eventReason,
   safePermissionCount, fingerprint, assessAttempt, positiveInt } from './core.mjs';
+import {safeMcpEventSources,acceptMcpEventSignal} from './mcp-events.mjs';
+import {createReporter,readReportState,publishedReport} from './report.mjs';
+import {createTelemetry} from './telemetry.mjs';
 
-const RESUME_TEXT = 'Автоматическое продолжение уже активной рабочей сессии после неожиданного завершения хода. Это не новое задание и не разрешение на Human Gate. Сверь фактическое состояние очереди, результаты исполнителей, git и ревью. Не повторяй завершённую работу. Если есть готовый следующий шаг, запусти его до отчёта; если всё завершено или есть настоящий блокер — зафиксируй состояние и не продолжай. Не посылай тестовые сообщения в рабочие чаты. Отчитайся простым русским языком.';
-const defaults = Object.freeze({enabled:true,pollMs:20000,minIdleMs:60000,cooldownMs:90000,
-  maxAttemptsWithoutProgress:2,maxIdleAgeHours:8,dryRun:false,sessionLeaseHours:36,agent:'Orchestrator'});
+const RESUME_TEXT = 'Автоматическое продолжение уже активной рабочей сессии после неожиданного завершения хода. Это не новое задание и не разрешение на Human Gate. Сверь каноническую durable-очередь, реальные Assignment/child/job, Git и ревью; не повторяй завершённое. Если предыдущий релиз DONE, но есть подтверждённая независимая готовая задача, проверь и атомарно исправь устаревший/дублирующийся машинный заголовок workflow_state.md через установленный workflow_checkpoint.py (inspect + SHA compare-and-apply) без изменения исходников и иных планов. Настоящий Human Gate и живой/неизвестный исполнитель неприкосновенны. Выполни безопасный следующий переход до отчёта, не создавая дублей. Не производи неразрешённых внешних действий. Отчитайся простым русским языком.';
+const defaults = Object.freeze({enabled:false,pollMs:20000,minIdleMs:60000,cooldownMs:90000,
+  maxAttemptsWithoutProgress:2,maxIdleAgeHours:8,dryRun:false,sessionLeaseHours:36,agent:'Orchestrator',reportEnabled:true});
 const empty = () => ({version:4,armedSessionId:null,agent:null,armedUntil:0,
   lastStartedAt:0,lastSucceededAt:0,lastAttemptForEnd:0,lastAttemptAt:0,
-  childSessions:{},childCoverage:false,childCoverageReason:null,
-  attempts:0,signature:null,suspended:false,pendingOwnerPrompt:false});
+  childSessions:{},childCoverage:false,childCoverageReason:null,mcpEventsSeen:[],
+  attempts:0,signature:null,suspended:false,pendingOwnerPrompt:false,reportRepair:null});
 
 function safeError(e){return String(e?.message ?? e).slice(0,300)}
 async function readJson(file){try{return JSON.parse(await fs.readFile(file,'utf8'))}catch{return null}}
@@ -43,7 +46,7 @@ export async function startGuard(ctx,{pluginDir,logger,now=()=>Date.now(),setInt
     await fs.appendFile(f,JSON.stringify({at:new Date().toISOString(),event,...extra})+'\n');
   }catch{}});
   let s=empty(),disposed=false,checking=false,ready=false;
-  let promptRegistration=null,contextRegistration=null,idleRegistration=null,timer=null;
+  let promptRegistration=null,contextRegistration=null,idleRegistration=null,reportRegistration=null,timer=null;
   let eventController=new AbortController();
   let automaticPromptInFlight=false;
   const runningChildren=new Set();
@@ -51,6 +54,45 @@ export async function startGuard(ctx,{pluginDir,logger,now=()=>Date.now(),setInt
   const repoHash=stateKey.slice(-12);
   const loadedAt=now();
   const logEvent=(event,detail={})=>log(event,{project:repoHash,...detail});
+  // Reporting state is ephemeral output, never a second queue or liveness proof.
+  let reportRoot=null,reportCandidate=null,reportModel=null,reportBoundary=null,reportEpoch=0,reportCorrection=false,lastPublishedMessage=null;
+  const telemetry=createTelemetry(now);
+  const reporter=createReporter(ctx,{repo,pluginDir,now,log:logEvent,getRoot:()=>reportCandidate,getModel:()=>reportModel});
+  const reportInstruction='REPORT CONTRACT v3.5: First dispatch all safe ready engineering work and persist the real checkpoint. Before EVERY substantive status, release answer or wait/idle boundary call workflow_report via the available native tool/Code Mode. Pass the verified canonical planning root. Publish its entire returned report verbatim in the primary assistant message (no rewrite, abbreviation, omitted queue or technical-only summary). Do not create a Reporter session or do separate arithmetic, clock, or status-only commits. If the tool is unavailable, give the full Russian degraded report with unknown values; never block engineering or fabricate proof. This is reporting only, not authority to dispatch/deploy.';
+  function injectReportInstruction(event){if(Array.isArray(event.system)&&reportRegistration)event.system.push({type:'text',text:reportInstruction});}
+  async function verifyReportBoundary(id,{allowRepair=false}={}){
+    if(!reportRegistration||reportRoot!==id||disposed||s.suspended||s.pendingOwnerPrompt)return;
+    const cfg=lastConfig??await config();if(!cfg.enabled||!cfg.reportEnabled||cfg.dryRun)return;
+    // Only the actual root's current execution; no startup/timer/report-only wake loops.
+    const epoch=reportEpoch;
+    if(reportBoundary===epoch)return;
+    if(allowRepair)reportBoundary=epoch;
+    try{
+      const state=await readReportState(repo);
+      const expected=reporter.expected(id,state.revision);
+      let messages=null;
+      if(expected&&typeof ctx.session.context==='function')messages=await bounded(ctx.session.context({sessionID:id}),8000,'report-context');
+      if(reportRoot!==id||reportEpoch!==epoch||s.suspended||s.pendingOwnerPrompt)return;
+      const published=expected&&publishedReport(messages,expected,lastPublishedMessage);
+      if(published){
+        reportBoundary=epoch;lastPublishedMessage=published;reporter.markPublished(id);await logEvent('report-published',{sessionId:id,revision:state.revision.slice(0,12)});return;
+      }
+      await logEvent('report-missing-or-unverified',{sessionId:id,revision:state.revision.slice(0,12)});
+      // Idle recovery is strictly reporting-only, once per state revision.
+      // It never overrides a human gate, pending permission or ordinary runnable transition.
+      if(!allowRepair||reportCorrection||s.reportRepair===state.revision||typeof ctx.session.synthetic!=='function'||!s.armedSessionId||s.armedSessionId!==id)return;
+      const decision=evaluateWork(state.scope,state.workflow);
+      if(!decision.ok||decision.mode!=='awaiting_children')return;
+      const perms=await bounded(ctx.permission.list({sessionID:id}),8000,'report-permissions');
+      if(safePermissionCount(perms)!==0||reportRoot!==id||reportEpoch!==epoch||s.suspended||s.pendingOwnerPrompt)return;
+      const latest=await readReportState(repo);if(latest.revision!==state.revision)return;
+      s.reportRepair=state.revision;reportCorrection=true;await save();
+      const msgID=`msg_${crypto.createHash('sha256').update(`report-contract:${id}:${state.revision}`).digest('hex').slice(0,24)}`;
+      // Native synthetic is not owner input or engineering permission. Do not retry ambiguous admission.
+      await bounded(ctx.session.synthetic({sessionID:id,id:msgID,text:'Служебное восстановление Report Contract: пропущен отчёт перед ожиданием. Это НЕ поручение и НЕ разрешение на действия. Только вызови workflow_report для текущего канонического плана и опубликуй его целиком в основной ленте. Не меняй очередь и не запускай агентов только ради отчёта. Если пришёл настоящий результат агента или появилось новое безопасное действие, обычный workflow имеет приоритет.'}),10000,'report-synthetic');
+      await logEvent('report-repair-admitted',{sessionId:id,revision:state.revision.slice(0,12)});
+    }catch{await logEvent('report-boundary-unverified',{sessionId:id});}
+  }
   async function config(){
     const c=await readJson(path.join(pluginDir,'config.json'));
     const v={...defaults,...(c&&typeof c==='object'?c:{})};
@@ -60,7 +102,8 @@ export async function startGuard(ctx,{pluginDir,logger,now=()=>Date.now(),setInt
       maxAttemptsWithoutProgress:positiveInt(v.maxAttemptsWithoutProgress,2,1,20),
       maxIdleAgeMs:positiveInt(v.maxIdleAgeHours,8,1,168)*3600000,
       leaseMs:positiveInt(v.sessionLeaseHours,36,1,168)*3600000,
-      agent:String(v.agent||'Orchestrator'),dryRun:v.dryRun===true};
+      agent:String(v.agent||'Orchestrator'),dryRun:v.dryRun===true,reportEnabled:v.reportEnabled!==false,
+      mcpEventSources:safeMcpEventSources(v.mcpEventSources)};
   }
   async function save(){await ctx.storage.set(stateKey,s)}
   async function clear(reason){
@@ -83,8 +126,15 @@ export async function startGuard(ctx,{pluginDir,logger,now=()=>Date.now(),setInt
       const id=event.sessionID;if(typeof id!=='string'||!id)return;
       const info=await bounded(ctx.session.get({sessionID:id}),12000,'context-get');
       if(!sessionMatches(info,id,repo,cfg.agent))return;
-      const {decision,stamps}=await eligibility();
-      if(!decision.ok){if(s.armedSessionId===id)await clear(decision.reason);return}
+      if(reportRoot&&reportRoot!==id){reporter.reset();reportRoot=null;reportEpoch++;reportBoundary=null;lastPublishedMessage=null;}
+      const {decision,stamps,scope,workflow}=await eligibility();
+      reportCandidate=scope?.schema==='openworkflow-progress-scope-v1'&&workflow?id:null;
+      reportModel=event.model??info.model??null;
+      if(!decision.ok){
+        // A closing workflow still needs its final report, but is not armed for execution.
+        if(reportCandidate===id&&cfg.reportEnabled)injectReportInstruction(event);
+        if(s.armedSessionId===id)await clear(decision.reason);return;
+      }
       const t=now();
       const created=Number(info.time?.created);
       const earliest=Number.isFinite(created)&&created>0 ? created : loadedAt;
@@ -104,7 +154,9 @@ export async function startGuard(ctx,{pluginDir,logger,now=()=>Date.now(),setInt
       if(s.suspended && !s.pendingOwnerPrompt)return;
       const fresh=s.armedSessionId!==id;
       if(fresh){s=empty();runningChildren.clear();}
-      else if(s.childSessions){
+      if(reportRoot!==id){reporter.reset();telemetry.reset();reportRoot=id;reportBoundary=null;reportEpoch++;reportCorrection=false;lastPublishedMessage=null;}
+      if(cfg.reportEnabled)injectReportInstruction(event);
+      if(!fresh&&s.childSessions){
         // A new actual primary model turn is the natural handoff boundary.
         // Retire only terminal child observations, never live/unknown work.
         for(const [child,record] of Object.entries(s.childSessions)){
@@ -127,6 +179,7 @@ export async function startGuard(ctx,{pluginDir,logger,now=()=>Date.now(),setInt
     if(!id||id!==s.armedSessionId||automaticPromptInFlight)return;
     // Structural observation only: DO NOT read event.prompt.text.
     s.pendingOwnerPrompt=true;
+    reportCorrection=false;reportEpoch++;reportBoundary=null;
     // A new external prompt supersedes any assumed idle continuation.
     s.lastSucceededAt=0;
     await save();
@@ -158,22 +211,52 @@ export async function startGuard(ctx,{pluginDir,logger,now=()=>Date.now(),setInt
     if(state==='running')runningChildren.add(id);
     else if(['succeeded','failed','interrupted','missing'].includes(state))runningChildren.delete(id);
     await save();
-    if(['succeeded','failed','interrupted'].includes(state)){
+    if(['succeeded','failed','interrupted'].includes(state)&&prev.state!==state){
+      reportCorrection=false;
       await logEvent('child-terminal-observed',{sessionId:id,parentID:parent,outcome:state});
-      // Reconciliation on the already-installed guard timer is safe and does
-      // not inject another completion notification or start a new watcher.
+      // Keep child identity durable; the existing guard reconciliation checks
+      // the authoritative terminal state before any wake/admission.
     }
     return true;
   }
   async function onEvent(event){
     if(disposed)return;
-    const id=eventSessionId(event);
     const type=eventType(event);
-    if(!id||!s.armedSessionId)return;
+    if(type==='experimental.mcp.event'){
+      // External MCP data is untrusted; only explicitly approved (server,name)
+      // pairs may trigger a read-only reconciliation of the currently armed root.
+      // They can NEVER create an Assignment, start an unarmed session or bypass
+      // Requirements Gate, reviewer, permissions or native child verification.
+      if(!s.armedSessionId || s.suspended || s.pendingOwnerPrompt)return;
+      const cfg=lastConfig??await config();
+      const signal=acceptMcpEventSignal(event,cfg.mcpEventSources,s.mcpEventsSeen);
+      if(!signal.ok)return;
+      s.mcpEventsSeen=signal.seen;
+      await save();
+      await logEvent('mcp-event-reconciliation-signal',{
+        server:signal.server,name:signal.name,truncated:signal.truncated});
+      // Do not enqueue a second prompt here: OpenCode's native
+      // opencode_watch_mcp_event already wakes the subscribed session with a
+      // synthetic external message. The guard only records a bounded signal.
+      // At that native wake Orchestrator must re-verify canonical project state.
+      // This avoids a race between two independent wake-up mechanisms.
+      return;
+    }
+    const id=eventSessionId(event);
+    if(!id)return;
+    const isObserved=id===reportRoot||id===s.armedSessionId||Object.hasOwn(s.childSessions??{},id);
+    if(isObserved){
+      const metric=telemetry.observe(type,id,event?.properties??event?.data??{});
+      if(metric)await logEvent('execution-telemetry',metric);
+    }
+    if(id===reportRoot&&type==='session.execution.started'){reportEpoch++;reportBoundary=null;}
+    if(id===reportRoot&&type==='session.execution.succeeded')void verifyReportBoundary(id);
+    if(id===reportRoot&&['session.execution.interrupted','session.execution.failed','session.error','session.deleted'].includes(type)){reporter.reset();reportRoot=null;reportEpoch++;reportBoundary=null;telemetry.reset();}
+    if(!s.armedSessionId)return;
     if(id!==s.armedSessionId){
       if(['session.created','session.execution.started','session.execution.succeeded',
         'session.execution.failed','session.execution.interrupted','session.deleted'].includes(type))
-        await trackChild(event,id,type);
+        {const tracked=await trackChild(event,id,type);if(tracked&&!isObserved&&type==='session.execution.started')telemetry.observe(type,id,event?.properties??event?.data??{});}
       return;
     }
     const t=now();
@@ -196,7 +279,8 @@ export async function startGuard(ctx,{pluginDir,logger,now=()=>Date.now(),setInt
   // actual primary idle boundary. It is a snapshot, not a liveness heartbeat.
   // Unknown job identifiers must not silently become 'no children'.
   async function onNativeIdle(event){
-    if(disposed||event?.sessionID!==s.armedSessionId)return;
+    if(disposed)return;
+    if(event?.sessionID!==s.armedSessionId){if(event?.sessionID===reportRoot)await verifyReportBoundary(reportRoot);return;}
     if(!Array.isArray(event.background))return;
     let complete=true;
     const children=s.childSessions??(s.childSessions={});
@@ -213,6 +297,7 @@ export async function startGuard(ctx,{pluginDir,logger,now=()=>Date.now(),setInt
     s.childCoverage=complete;
     s.childCoverageReason=complete?'native-idle-background':'unidentified-native-background';
     await save();
+    await verifyReportBoundary(event.sessionID,{allowRepair:true});
   }
   // Optional inventory is useful on hosts exposing session.list, but that API
   // is NOT required by the current V2 Promise Plugin domain. For hosts without
@@ -373,7 +458,21 @@ export async function startGuard(ctx,{pluginDir,logger,now=()=>Date.now(),setInt
       s.lastSucceededAt=0;s.lastStartedAt=0;s.pendingOwnerPrompt=false;
       s.childCoverage=false;s.childCoverageReason='backend-restarted';
       s.childSessions=(s.childSessions&&typeof s.childSessions==='object'&&!Array.isArray(s.childSessions))?s.childSessions:{};
+      s.mcpEventsSeen=Array.isArray(s.mcpEventsSeen)?s.mcpEventsSeen.slice(-96):[];
       await save();
+    }
+    if(cfg.reportEnabled&&typeof ctx.tool?.transform==='function'){
+      try{reportRegistration=await ctx.tool.transform(editor=>editor.add({
+        name:'workflow_report',description:'Read-only one-shot Reporter. Use after engineering dispatch and checkpoint, before every primary status/wait/release. Returns complete Russian text; publish unchanged. No separate Reporter session.',
+        input:{type:'object',properties:{canonical_root:{type:'string',description:'Verified absolute canonical planning root, not a release/worker checkout'}},required:['canonical_root'],additionalProperties:false},options:{codemode:true},
+        execute:async(input,toolContext)=>{
+          if(typeof input.canonical_root!=='string'||!path.isAbsolute(input.canonical_root)||normalizePath(path.resolve(input.canonical_root))!==normalizePath(repo))throw Error('Canonical planning root differs from this session location; use the explicit verified canonical plan for a degraded/manual report, do not certify this checkout.');
+          if(disposed||!(await config()).reportEnabled)throw Error('Reporter unavailable');
+          if(toolContext.sessionID!==reportCandidate)throw Error('Reporter is restricted to verified primary session');
+          const text=await reporter.generate(toolContext.sessionID,toolContext.signal);
+          return {content:[{type:'text',text}]};
+        }
+      }));}catch{await logEvent('report-tool-unavailable');}
     }
     contextRegistration=await ctx.session.hook('context',modelContext);
     promptRegistration=await ctx.session.hook('prompt',promptAdmission);
@@ -390,10 +489,10 @@ export async function startGuard(ctx,{pluginDir,logger,now=()=>Date.now(),setInt
             retries=0;
             await onEvent(event);
           }
-          if(!disposed){s.childCoverage=false;s.childCoverageReason='event-stream-ended';
+          if(!disposed){telemetry.markGap();s.childCoverage=false;s.childCoverageReason='event-stream-ended';
             await save();await logEvent('event-stream-ended');}
         }catch(e){
-          if(!disposed){s.childCoverage=false;s.childCoverageReason='event-stream-error';
+          if(!disposed){telemetry.markGap();s.childCoverage=false;s.childCoverageReason='event-stream-error';
             await save();await logEvent('event-stream-error',{message:safeError(e)});}
         }
         if(disposed)break;
@@ -408,13 +507,13 @@ export async function startGuard(ctx,{pluginDir,logger,now=()=>Date.now(),setInt
       }
     })();
     timer=setIntervalFn(()=>{void check('timer')},cfg.pollMs);
-    await logEvent('plugin-loaded',{version:'4.5',sessionTracking:'model-context-and-execution-events'});
+    await logEvent('plugin-loaded',{version:'4.7',sessionTracking:'model-context-and-execution-events'});
     return async()=>{
       disposed=true;ready=false;
       if(timer!==null)clearIntervalFn(timer);
       eventController.abort();
       await promptRegistration?.dispose?.();await contextRegistration?.dispose?.();
-      await idleRegistration?.dispose?.();
+      await idleRegistration?.dispose?.();await reportRegistration?.dispose?.();reporter.reset();telemetry.reset();
     };
   }
   return {init,check,onEvent,modelContext,promptAdmission,getState:()=>({...s})};

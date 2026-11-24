@@ -536,7 +536,45 @@ def inventory(args):
         p=CONFIG/name
         if p.exists(): add(p,'legacy_inspect_only')
     if args.sizes: rows.sort(key=lambda x:x.get('bytes',0),reverse=True)
-    print(json.dumps({'workspace':str(ROOT),'free_bytes':shutil.disk_usage(ROOT if ROOT.exists() else CONFIG).free,'items':rows},ensure_ascii=False,indent=2))
+    free_bytes = shutil.disk_usage(ROOT if ROOT.exists() else CONFIG).free
+    if args.repo:
+        # Lightweight and *read-only* reconciliation view. A row can be owned
+        # without being idle/completed, so this deliberately never calls it a
+        # deletion candidate. Free disk space is NOT a lifecycle exemption.
+        repo = str(canonical(args.repo))
+        owned = []
+        unattributed = []
+        for row in rows:
+            marker = row.get('ownership')
+            if isinstance(marker, dict) and marker.get('repo') == repo:
+                owned.append(row)
+            elif not isinstance(marker, dict):
+                unattributed.append({'path':row['path'],'category':row['category']})
+        groups = {}
+        for row in owned:
+            marker = row['ownership']
+            key = (str(marker.get('epic') or '<unscoped>'),
+                   str(marker.get('unit') or '<untagged>'))
+            group = groups.setdefault(key, {'epic':key[0], 'unit':key[1], 'count':0,
+                                            'categories':{}, 'example_paths':[]})
+            group['count'] += 1
+            kind = row['category']
+            group['categories'][kind] = group['categories'].get(kind, 0) + 1
+            if len(group['example_paths']) < 3:
+                group['example_paths'].append(row['path'])
+        output = {'workspace':str(ROOT), 'repo':repo, 'free_bytes':free_bytes,
+                  'cleanup_policy':'lifecycle_based_not_disk_capacity',
+                  'notice':'Registered ownership does not prove completion, idle consumers or safe deletion.',
+                  'owned_count':len(owned), 'ownership_groups':list(groups.values()),
+                  'unattributed_count':len(unattributed),
+                  'unattributed_examples':unattributed[:12],
+                  'unattributed_notice':'Inspect provenance and consumers; do not delete by path/name/age.'}
+        if args.all_paths:
+            output['owned_paths'] = owned
+            output['unattributed_paths'] = unattributed
+        print(json.dumps(output,ensure_ascii=False,indent=2))
+        return 0
+    print(json.dumps({'workspace':str(ROOT),'free_bytes':free_bytes,'items':rows},ensure_ascii=False,indent=2))
 
 def shared_scratch_close(args):
     """Remove plugin-owned *temporary* shared areas only when all project consumers are idle.
@@ -688,7 +726,7 @@ def main():
         a.add_argument('--apply',action='store_true')
         a.set_defaults(action=action)
     a=sub.add_parser('unit-check');a.add_argument('--repo',required=True);a.add_argument('--epic',required=True);a.add_argument('--unit',required=True);a.add_argument('--retention-file');a.set_defaults(action=unit_check)
-    a=sub.add_parser('inventory');a.add_argument('--sizes',action='store_true');a.set_defaults(action=inventory)
+    a=sub.add_parser('inventory');a.add_argument('--sizes',action='store_true');a.add_argument('--repo',help='compact read-only ownership summary for one project');a.add_argument('--all-paths',action='store_true',help='include all owned and unattributed paths in --repo report');a.set_defaults(action=inventory)
     a=sub.add_parser('shared-scratch-close')
     a.add_argument('--repo',required=True)
     a.add_argument('--confirmed-project-idle',action='store_true')

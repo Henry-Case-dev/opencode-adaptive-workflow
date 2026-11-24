@@ -41,6 +41,46 @@ class HygieneTests(unittest.TestCase):
             self.fail(f'cli failed: {r.stderr}\n{r.stdout}')
         return r
 
+    def test_inventory_repo_compact_shows_owned_even_when_disk_has_space(self):
+        run = Path(self.cli('allocate', '--repo', self.repo, '--epic', 'epic-a',
+                            '--unit', 'unit-a', '--kind', 'probe').stdout.strip())
+        (run / 'scratch.txt').write_text('disposable once check done')
+        unowned = self.workspace / 'old_agent_probe.py'
+        unowned.parent.mkdir(parents=True, exist_ok=True)
+        unowned.write_text('unknown provenance')
+        other = self.dir / 'source' / 'other'
+        other.mkdir()
+        self.git('-C', str(other), 'init', '-q')
+        foreign = Path(self.cli('allocate','--repo',other,'--epic','other',
+                                '--unit','foreign','--kind','probe').stdout.strip())
+        result = json.loads(self.cli('inventory','--repo',self.repo).stdout)
+        self.assertEqual(result['cleanup_policy'], 'lifecycle_based_not_disk_capacity')
+        self.assertGreater(result['free_bytes'], 0)
+        self.assertEqual(result['owned_count'], 1)
+        self.assertEqual(result['ownership_groups'][0]['unit'], 'unit-a')
+        self.assertIn(str(unowned), [x['path'] for x in result['unattributed_examples']])
+        self.assertNotIn('owned_paths',result)  # concise by default
+        self.assertTrue(run.exists())          # inventory never deletes
+        self.assertTrue(unowned.exists())
+        self.assertTrue(foreign.exists())
+        full = json.loads(self.cli('inventory','--repo',self.repo,'--all-paths').stdout)
+        self.assertEqual([x['path'] for x in full['owned_paths']], [str(run)])
+
+    def test_inventory_read_only_never_deletes_even_with_ample_free_space(self):
+        run=Path(self.cli('allocate','--repo',self.repo,'--epic','proof',
+                          '--unit','u','--kind','probe').stdout.strip())
+        (run/'needs-review.sqlite').write_text('protected evidence')
+        result=json.loads(self.cli('inventory','--repo',self.repo).stdout)
+        self.assertEqual(result['owned_count'],1)
+        self.assertTrue((run/'needs-review.sqlite').exists())
+        # Lifecycle close still enforces protected data even if a caller
+        # claims consumer/evidence checks completed.
+        close=self.cli('unit-close','--repo',self.repo,'--epic','proof',
+                       '--unit','u','--apply','--confirmed-idle',
+                       '--confirmed-evidence',ok=False)
+        self.assertNotEqual(close.returncode,0)
+        self.assertTrue((run/'needs-review.sqlite').exists())
+
     def test_workspace_path_portable(self):
         self.cli('init')
         self.assertTrue((self.workspace/'temp').exists())

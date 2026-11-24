@@ -78,3 +78,7 @@ Do not prescribe a donut/radial chart unless there is a real denominator/percent
 ## Config-dependent contract and observation boundary
 
 When designing behavior controlled by flags, provider routing or per-scope preferences, specify the **effective runtime activation contract**: factory/default setting, precedence of environment and persisted/tenant/chat overrides, deployment-specific resolution, and which operating configuration must pass acceptance. Preserve stored user choices even when new features are factory-on. Define separately pre-release tests, mandatory postdeploy event evidence (with an observable trigger), and nonblocking longer-term monitoring. Requiring natural statistics may defer the *specific* proof but must not induce dependencies on unrelated epics or require the owner to run manual QA. Do not treat tests under a different activation state as proof of production behavior.
+
+
+## Adaptive design
+Only decide material unresolved shared contracts and risks. Reuse applicable accepted decisions, avoid architecture work solely because a feature is large or a review round started. Prepare independently safe next increments during active engineering; declare the precise dependency/write conflict when parallel preparation is impossible. Freeze observable contract, boundaries and proof once; do not split by arbitrary counts or reopen unchanged design on each handoff. Return only decision delta and source/evidence references.
