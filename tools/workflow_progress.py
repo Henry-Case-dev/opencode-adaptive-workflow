@@ -743,9 +743,11 @@ def _load_scope(scope_path: str, label: str, reads: SnapshotReads | None = None)
         snap["reason"] = ("есть зарегистрированные, но ещё не согласованные поручения владельца: "
                           + ", ".join(pending_inputs[:8]) if pending_inputs else
                           "область задач или их подтверждения устарели; сначала сверить исходники, карты и статусы")
-        return snap
-    if map_paths:
-        snap.update(_load_maps(map_paths, namespaces=map_namespaces, project=project, reads=reads))
+        if stale:
+            return snap
+    map_summary = _load_maps(map_paths, namespaces=map_namespaces, project=project, reads=reads) if map_paths else {}
+    if not pending_inputs:
+        snap.update(map_summary)
     if uncovered:
         snap["requirements_measurable"] = False
         snap["requirements_reason"] = f"{len(uncovered)} задач ещё не перенесены полностью в карты требований"
@@ -754,6 +756,14 @@ def _load_scope(scope_path: str, label: str, reads: SnapshotReads | None = None)
         snap["requirements_reason"] = "нет карт требований"
     else:
         snap["requirements_measurable"] = True
+    # Reporting-only counts for the already registered, validated scope. Never
+    # relax measurable or requirements_measurable for acceptance/continuation.
+    if (pending_inputs or uncovered) and not stale:
+        snap["registered_scope_progress"] = {"tasks": snap["tasks"]}
+        # A valid mapped subset is visible even while a new task is unmapped.
+        snap["registered_scope_progress"].update({k: map_summary[k] for k in ("slices", "requirements") if k in map_summary})
+        if pending_inputs:
+            snap["requirements_measurable"] = False
     return snap
 
 
@@ -779,9 +789,12 @@ def snapshot(paths: list[str], label: str, scope_file: str | None = None,
         changed = reads.changed()
         if changed:
             snap["measurable"] = False
+            snap.pop("registered_scope_progress", None)
             snap["reason"] = "файлы изменились во время подсчёта; нужен новый снимок"
             snap.setdefault("stale_sources", []).append(changed)
         if require_queue and not snap["queue_registration_complete"]:
+            if snap["measurable"] and not snap.get("stale_sources"):
+                snap.setdefault("registered_scope_progress", {k: snap[k] for k in ("tasks", "slices", "requirements") if k in snap})
             snap["measurable"] = False
             queue_reason = "очередь исполнения не завершена: отсутствует позиция, приоритет или проверяемая зависимость"
             snap["reason"] = snap.get("reason", "") + ("; " if snap.get("reason") else "") + queue_reason
@@ -879,6 +892,7 @@ def main(argv: list[str] | None = None) -> int:
             data["lineage_checked"] = True
             if any(row["needs_reconciliation"] for row in comparisons):
                 data["measurable"] = False
+                data.pop("registered_scope_progress", None)
                 data["reason"] = "реестры разных рабочих копий/релизов расходятся; сначала сверить lineage и доказательства"
                 data.setdefault("stale_sources", []).append("обнаружен cross-branch scope drift")
         elif args.scope_file:

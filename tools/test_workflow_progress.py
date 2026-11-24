@@ -243,6 +243,15 @@ class WorkflowProgressTests(unittest.TestCase):
         self.assertFalse(snap["measurable"])
         self.assertEqual(snap["tasks"], {"done":1,"total":1})
         self.assertIn("in2", progress.present(snap))
+        self.assertFalse(snap["requirements_measurable"])
+        self.assertNotIn("requirements", snap)
+        self.assertEqual(snap["registered_scope_progress"]["requirements"], {"done":1,"total":1})
+        self.assertEqual(snap["registered_scope_progress"]["slices"], {"done":1,"total":1})
+        # Source drift invalidates even the partial display.
+        Path(initial).write_text("changed", encoding="utf-8")
+        drift = progress.snapshot([], "project", self.scope_with_inputs(tasks, inp))
+        self.assertFalse(drift["measurable"])
+        self.assertNotIn("registered_scope_progress", drift)
 
     def test_reconciled_short_amendment_does_not_create_second_task(self):
         m = self.write_map("map.json", [("R1", "S", "VERIFIED"),("R2", "S", "PENDING")])

@@ -39,7 +39,7 @@ test('attempt limit, cooldown, idle and completion dedupe',()=>{
 });
 
 async function harness({statusText=status,scope=baseScope(),permissions=[],startTime=100000,
-  waitFn=async()=>{},promptFn=null,listFn=async()=>({items:[],cursor:{next:null}}),guardConfig={}}={}){
+  waitFn=async()=>{},promptFn=null,listFn=async()=>({items:[],cursor:{next:null}}),guardConfig={},reportFixture=false}={}){
   const repo=await fs.mkdtemp(path.join(os.tmpdir(),'guard-v4-test-'));
   const sub=path.join(repo,'plans');await fs.mkdir(sub);
   await fs.writeFile(path.join(sub,'workflow_state.md'),statusText);
@@ -57,9 +57,15 @@ async function harness({statusText=status,scope=baseScope(),permissions=[],start
       if(promptFn)await promptFn(v);return {id:v.id};},
       hook:async(name,fn)=>{hooks[name]=fn;return {dispose:async()=>{delete hooks[name]}}}},
     permission:{list:async()=>permissions},event:{subscribe:async function*(){}},};
+  let reportTool;const synthetic=[];let contextMessages=[];
+  if(reportFixture){
+    ctx.tool={transform:async fn=>{fn({add:t=>{reportTool=t}});return {dispose:async()=>{}}}};
+    ctx.session.context=async()=>contextMessages;
+    ctx.session.synthetic=async v=>{synthetic.push(v);return {id:v.id}};
+  }
   const guard=await startGuard(ctx,{pluginDir,logger:async(e,v)=>{logs.push({e,...v})},now:()=>now,setIntervalFn:()=>0,clearIntervalFn:()=>{}});
   const dispose=await guard.init();
-  return {repo,guard,ctx,hooks,logs,admissions,dispose, setTime:t=>{now=t},
+  return {repo,guard,ctx,hooks,logs,admissions,synthetic,reportTool,setContextMessages:v=>{contextMessages=v},dispose, setTime:t=>{now=t},
     markRunning:async()=>{
       await hooks.context({sessionID:'ses_root',agent:'Orchestrator'});
       await guard.onEvent({type:'session.execution.started',properties:{sessionID:'ses_root'}});
@@ -561,4 +567,52 @@ test('v3.4: missing/malformed checkpoint cannot be auto-rescued by a queued task
    'Status: done\nHuman gate: none\nNext execution: fabricated']){
    assert.equal(evaluateWork(scope,wf).ok,false);
  }
+});
+
+
+test('report runtime: native final text confirms full report; same revision needs new receipt',async()=>{
+ const h=await harness({reportFixture:true,statusText:status.replace('runnable','awaiting_children')});
+ try{
+  await h.markRunning();const root='ses_root';
+  const invoke=async()=> (await h.reportTool.execute({canonical_root:h.repo},{sessionID:root})).content[0].text;
+  const a=await invoke();assert.match(a,/Публикация:/);
+  const textEvent=(msg,ordinal,text)=>({type:'session.text.ended',data:{sessionID:root,assistantMessageID:msg,ordinal,text}});
+  await h.guard.onEvent(textEvent('msg_a',0,a));await h.hooks['experimental.idle']({sessionID:root,background:[]});
+  assert.equal(h.logs.filter(x=>x.e==='report-published').length,1);
+  await h.ended();await h.guard.onEvent({id:'evt_b',type:'session.execution.started',data:{sessionID:root}});
+  const b=await invoke();assert.notEqual(a.match(/Публикация: (.*)/)[1],b.match(/Публикация: (.*)/)[1]);
+  await h.guard.onEvent({id:'evt_b',type:'session.execution.started',data:{sessionID:root}}); // duplicate start
+  await h.guard.onEvent(textEvent('msg_b',0,b));await h.hooks['experimental.idle']({sessionID:root,background:[]});
+  assert.equal(h.logs.filter(x=>x.e==='report-published').length,2);assert.equal(h.synthetic.length,0);
+  await assert.rejects(h.reportTool.execute({canonical_root:h.repo},{sessionID:'child'}));
+ }finally{await h.cleanup()}
+});
+test('report runtime: missing report repair is once; tool or reasoning output cannot count',async()=>{
+ const h=await harness({reportFixture:true,statusText:status.replace('runnable','awaiting_children')});
+ try{
+  await h.markRunning();const root='ses_root';const a=(await h.reportTool.execute({canonical_root:h.repo},{sessionID:root})).content[0].text;
+  h.setContextMessages([{type:'tool',id:'msg_tool',content:{type:'text',text:a}}]);
+  await h.guard.onEvent({type:'session.reasoning.ended',data:{sessionID:root,assistantMessageID:'msg_a',ordinal:0,text:a}});
+  await Promise.all([h.hooks['experimental.idle']({sessionID:root,background:[]}),h.hooks['experimental.idle']({sessionID:root,background:[]})]);
+  assert.equal(h.logs.filter(x=>x.e==='report-published').length,0);assert.equal(h.synthetic.length,1);
+  await h.guard.onEvent({type:'session.execution.started',data:{sessionID:root}});
+  await h.hooks['experimental.idle']({sessionID:root,background:[]});assert.equal(h.synthetic.length,1);
+ }finally{await h.cleanup()}
+});
+test('report recovery respects a real permission or human gate',async()=>{
+ for(const opt of [{permissions:[{id:'p'}],statusText:status.replace('runnable','awaiting_children')},{statusText:status.replace('none','permission').replace('runnable','awaiting_children')}]){
+  const h=await harness({reportFixture:true,...opt});try{await h.markRunning();await h.hooks['experimental.idle']({sessionID:'ses_root',background:[]});assert.equal(h.synthetic.length,0);}finally{await h.cleanup()}
+ }
+});
+
+test('report runtime: a flattened full report with correct receipt cannot certify publication',async()=>{
+ const h=await harness({reportFixture:true,statusText:status.replace('runnable','awaiting_children')});
+ try{
+  await h.markRunning();const root='ses_root';
+  const report=(await h.reportTool.execute({canonical_root:h.repo},{sessionID:root})).content[0].text;
+  await h.guard.onEvent({type:'session.text.ended',data:{sessionID:root,assistantMessageID:'msg_flat',ordinal:0,text:report.replace(/\n+/g,' ')}});
+  await h.hooks['experimental.idle']({sessionID:root,background:[]});
+  assert.equal(h.logs.filter(x=>x.e==='report-published').length,0);assert.equal(h.synthetic.length,1);
+  await h.hooks['experimental.idle']({sessionID:root,background:[]});assert.equal(h.synthetic.length,1);
+ }finally{await h.cleanup()}
 });
