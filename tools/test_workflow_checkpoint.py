@@ -66,9 +66,9 @@ class CheckpointRepair(unittest.TestCase):
     def test_no_admitted_task_does_not_create_one(self):
         self.scope.write_text(json.dumps({'schema':SCHEMA,'tasks':[task('P0','VERIFIED'),task('C2','PENDING',None,[])]}))
         self.assertFalse(json.loads(self.runcli().stdout)['safe'])
-    def test_duplicate_active_queue_position_is_not_certified(self):
+    def test_equal_positions_do_not_block_independent_tasks(self):
         self.scope.write_text(json.dumps({'schema':SCHEMA,'tasks':[task('C2','PENDING',1,[]),task('C3','PENDING',1,[])]}))
-        self.assertFalse(json.loads(self.runcli().stdout)['safe'])
+        self.assertTrue(json.loads(self.runcli().stdout)['safe'])
     def test_cancelled_does_not_satisfy_predecessor(self):
         self.scope.write_text(json.dumps({'schema':SCHEMA,'tasks':[task('P0','CANCELLED'),task('C2','PENDING',2,['P0'])]}))
         self.assertFalse(json.loads(self.runcli().stdout)['safe'])

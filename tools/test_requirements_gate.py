@@ -443,6 +443,104 @@ class GateTests(unittest.TestCase):
         self.save()
         self.run_gate("check", "--map", str(self.map), "--stage", "plan", expected=1)
 
+    def test_strict_delivery_receipt_end_to_end_and_stale_evidence(self):
+        """Use actual Git and actual gate output, not a prearranged PASS string."""
+        if not shutil.which("git"):
+            self.skipTest("git not available")
+        from importlib.util import spec_from_file_location, module_from_spec
+        spec = spec_from_file_location("workflow_progress", SCRIPT.with_name("workflow_progress.py"))
+        progress = module_from_spec(spec); spec.loader.exec_module(progress)
+        def git(*args):
+            return subprocess.run(["git", "-C", str(self.path), *args], check=True,
+                                  text=True, capture_output=True).stdout.strip()
+        git("init", "-q")
+        git("config", "user.email", "test@example.invalid")
+        git("config", "user.name", "Gate Test")
+        (self.path / "product.py").write_text("def feature(): return 42\n", encoding="utf8")
+        git("add", "product.py")
+        git("commit", "-qm", "candidate")
+        candidate = git("rev-parse", "HEAD")
+        self.configure()
+        self.data.update(candidate_commit=candidate, deployed_commit=candidate)
+        for name in ("test.md", "review.md", "smoke.md"):
+            (self.path / name).write_text("Synthetic test fixture: " + name, encoding="utf8")
+        for row in self.data["items"]:
+            row["evidence"][0].update(candidate_commit=candidate, artifact_path="test.md")
+            self.approval(row, candidate=candidate)
+        wait = dict(nonblocking=True, reason="requires an external event", trigger="event", next_check="on event", owner="DevOps", contract_ref="REQ-1")
+        first = self.data["items"][0]
+        first.update(status="READY_FOR_LIVE", postrelease_wait=wait)
+        first["evidence"][0]["type"] = "integration"
+        first["evidence"][-1]["approved_postrelease_wait"] = wait.copy()
+        self.data["delivery_evidence"] = [dict(type="production", ref="smoke.md", artifact_path="smoke.md", observation="fixture deployment evidence", candidate_commit=candidate, deployed_commit=candidate)]
+        self.save()
+        args = ("check", "--map", str(self.map), "--stage", "delivery", "--candidate", candidate, "--deployed-commit", candidate, "--repo", str(self.path), "--strict-evidence")
+        output = self.run_gate(*args, expected=0)
+        self.assertIn("delivery_receipt_v1=", output)
+        receipt = self.path / "delivery.log"
+        receipt.write_text(output, encoding="utf8")
+        task = {"id":"T1", "status":"WAITING_EXTERNAL", "execution_state":"delivered_awaiting_evidence", "deferred_req_ids":["REQ-1"], "delivery_gate_ref":"delivery.log", "source_path":str(self.source), "source_sha256":self.data["source_sha256"], "maps":[str(self.map)], "coverage_complete":True, "queue_position":1, "priority":"P0", "blocked_by":[]}
+        scope = self.path / "progress_scope.json"
+        def snapshot():
+            scope.write_text(json.dumps({"schema":progress.SCOPE_SCHEMA,"tasks":[task]}),encoding="utf8")
+            return progress.legacy_snapshot([], "project", str(scope))
+        result = snapshot()
+        self.assertEqual(result["engineering_delivery"]["done"], 1)
+        self.assertEqual(result["tasks"]["done"], 0)
+        self.assertEqual(result["engineering_queue"]["task_ids"], [])
+        self.assertEqual(result["engineering_delivery"]["external_evidence_task_ids"], ["T1"])
+        # A stale or edited artifact must not continue certifying delivery.
+        smoke = self.path / "smoke.md"
+        original = smoke.read_bytes()
+        smoke.write_text("Changed evidence",encoding="utf8")
+        result = snapshot()
+        self.assertEqual(result["engineering_delivery"]["done"], 0)
+        self.assertEqual(result["engineering_delivery"]["reconcile_task_ids"], ["T1"])
+        self.assertEqual(result["engineering_queue"]["task_ids"], ["T1"])
+        smoke.write_bytes(original)
+        # Old plain PASS or fabricated closure timestamps are not receipts.
+        receipt.write_text('engineering_delivery=PASS\nacceptance=PENDING_FUTURE_EVIDENCE\ndeferred_req_ids=["REQ-1"]\n',encoding="utf8")
+        task["engineering_closed_at"] = "2026-11-27"
+        self.assertEqual(snapshot()["engineering_delivery"]["done"],0)
+        receipt.write_text(output,encoding="utf8")
+        # A second map cannot be silently omitted from a whole-task receipt.
+        other = self.path / "second.json"
+        other.write_bytes(self.map.read_bytes()); task["maps"].append(str(other))
+        self.assertEqual(snapshot()["engineering_delivery"]["done"],0)
+        task["maps"].pop()
+        # Material map changes invalidate prior receipt and failed requirements cannot be parked.
+        first["status"] = "FAILED"; self.save()
+        self.assertEqual(snapshot()["engineering_delivery"]["done"],0)
+        self.assertNotIn("delivery_receipt_v1=", self.run_gate(*args,expected=1))
+
+    def test_non_deployment_receipt_requires_strict_review_and_no_live_claim(self):
+        if not shutil.which("git"):
+            self.skipTest("git not available")
+        from importlib.util import spec_from_file_location, module_from_spec
+        spec = spec_from_file_location("workflow_progress", SCRIPT.with_name("workflow_progress.py"))
+        progress = module_from_spec(spec); spec.loader.exec_module(progress)
+        def git(*args):
+            return subprocess.run(["git","-C",str(self.path),*args],check=True,text=True,capture_output=True).stdout.strip()
+        git("init","-q");git("config","user.email","test@example.invalid");git("config","user.name","Gate Test")
+        git("add","task.md");git("commit","-qm","candidate");candidate=git("rev-parse","HEAD")
+        self.configure(); self.data.update(candidate_commit=candidate,deployed_commit="",delivery_kind="non_deployment")
+        (self.path/"proof.md").write_text("Synthetic fixture: actual output checked",encoding="utf8")
+        for row in self.data["items"]:
+            row.update(live_required=False,live_when="preprod")
+            row["evidence"][0].update(type="inspection",candidate_commit=candidate,artifact_path="proof.md")
+            self.approval(row,candidate=candidate)
+        self.save()
+        args=("check","--stage","delivery","--map",str(self.map),"--candidate",candidate,"--repo",str(self.path),"--non-deployment","--strict-evidence")
+        output=self.run_gate(*args,expected=0)
+        (self.path/"delivery.log").write_text(output,encoding="utf8")
+        task=dict(id="T1",status="VERIFIED",maps=[str(self.map)],coverage_complete=True,delivery_gate_ref="delivery.log")
+        result=progress.audit_delivery_receipts([task],self.path,progress.SnapshotReads(),[])
+        self.assertEqual(result["certified_task_ids"],["T1"])
+        self.data["items"][0]["live_required"]=True;self.save()
+        self.assertNotIn("delivery_receipt_v1=",self.run_gate(*args,expected=1))
+        self.data["items"][0]["live_required"]=False;self.data["items"][0]["evidence"].pop();self.save()
+        self.assertNotIn("delivery_receipt_v1=",self.run_gate(*args,expected=1))
+
 
 if __name__ == "__main__":
     unittest.main()

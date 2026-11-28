@@ -117,27 +117,44 @@ test('queue uses exact original source codes, mapped aliases, and labeled fallba
  const repo=await fs.mkdtemp(path.join(os.tmpdir(),'report-prefix-'));
  try{
   await fs.mkdir(path.join(repo,'plans'));
-  const h='ADMINBOT — VMQ-ONTO-01: Интеграция памяти';
+  const h='EXAMPLE PROJECT — MEMORY-DESIGN-01: Интеграция памяти';
   const sid='H1:'+crypto.createHash('sha256').update(h.toLowerCase()).digest('hex').slice(0,12)+':1';
-  const taskScope={schema:scope.schema,tasks:[{id:'fc-trust-01',title:'Достоверный фактчек',status:'PENDING',queue_position:9},{id:'vmq-memory-rework',title:'Улучшение памяти',status:'PENDING',queue_position:10},{id:'unknown-code-01',title:'Другая задача',status:'PENDING',queue_position:11},{id:'code-example-01',title:'Пример задачи',status:'PENDING',queue_position:12}],source_inventory:{source_path:'plans/current_task.md',heading_level:1,sections:[{id:sid,disposition:'mapped',target_task_ids:['vmq-memory-rework']}]}};
-  const source='# ADMINBOT — FC-TRUST-01 — Достоверный фактчек\n# '+h+'\n```md\n# CODE-EXAMPLE-01\n```\n';
+  const taskScope={schema:scope.schema,tasks:[{id:'search-quality-01',title:'Достоверный фактчек',status:'PENDING',queue_position:9},{id:'memory-rework',title:'Улучшение памяти',status:'PENDING',queue_position:10},{id:'unknown-code-01',title:'Другая задача',status:'PENDING',queue_position:11},{id:'code-example-01',title:'Пример задачи',status:'PENDING',queue_position:12}],source_inventory:{source_path:'plans/current_task.md',heading_level:1,sections:[{id:sid,disposition:'mapped',target_task_ids:['memory-rework']}]}};
+  const source='# EXAMPLE PROJECT — SEARCH-QUALITY-01 — Достоверный фактчек\n# '+h+'\n```md\n# CODE-EXAMPLE-01\n```\n';
   await fs.writeFile(path.join(repo,'plans','current_task.md'),source);await fs.writeFile(path.join(repo,'plans','progress_scope.json'),JSON.stringify(taskScope));await fs.writeFile(path.join(repo,'plans','workflow_state.md'),'Human gate: none');
-  const state=await readReportState(repo);const text=renderReport(reportFacts(state,progress),{titles:{'fc-trust-01':'НЕВЕРНЫЙ-CODE-99'}});
-  assert.match(text,/- №9\. \*\*FC-TRUST-01\*\* — Достоверный фактчек/);
-  assert.match(text,/- №10\. \*\*VMQ-ONTO-01\*\* — Улучшение памяти/);
+  const state=await readReportState(repo);const text=renderReport(reportFacts(state,progress),{titles:{'search-quality-01':'НЕВЕРНЫЙ-CODE-99'}});
+  assert.match(text,/- №9\. \*\*SEARCH-QUALITY-01\*\* — Достоверный фактчек/);
+  assert.match(text,/- №10\. \*\*MEMORY-DESIGN-01\*\* — Улучшение памяти/);
   assert.match(text,/- №11\. ID: \*\*unknown-code-01\*\* — Другая задача/);
   assert.match(text,/- №12\. ID: \*\*code-example-01\*\* — Пример задачи/);
   assert.doesNotMatch(text,/CODE-EXAMPLE-01|НЕВЕРНЫЙ/);
-  await fs.writeFile(path.join(repo,'plans','current_task.md'),source.replace('FC-TRUST-01','FC-TRUST-02'));
-  const revised=await readReportState(repo);assert.notEqual(revised.revision,state.revision);assert.equal(revised.sourcePrefixes.has('fc-trust-01'),false);
+  await fs.writeFile(path.join(repo,'plans','current_task.md'),source.replace('SEARCH-QUALITY-01','SEARCH-QUALITY-02'));
+  const revised=await readReportState(repo);assert.notEqual(revised.revision,state.revision);assert.equal(revised.sourcePrefixes.has('search-quality-01'),false);
  }finally{await fs.rm(repo,{recursive:true,force:true});}
 });
 test('ambiguous or unlinked headings never turn a registry slug into an alleged exact prefix',()=>{
- const h='ADMINBOT — FIRST-01 — SECOND-02';
+ const h='EXAMPLE PROJECT — FIRST-01 — SECOND-02';
  const id='H1:'+crypto.createHash('sha256').update(h.toLowerCase()).digest('hex').slice(0,12)+':1';
  const r={id:'alias',status:'PENDING'};
  const s={tasks:[r],source_inventory:{source_path:'plans/current_task.md',heading_level:1,sections:[{id,disposition:'mapped',target_task_ids:['alias','other']}]}};
  assert.equal(sourcePrefixes(s,'# '+h).size,0);
  s.source_inventory.sections[0].target_task_ids=['alias'];s.source_inventory.sections.push({...s.source_inventory.sections[0]});assert.equal(sourcePrefixes(s,'# '+h).size,0);
  assert.equal(sourcePrefixes({tasks:[{id:'first-01'}]},'# FIRST-010').size,0);
+});
+test('liveness report distinguishes suspicion, permissions and terminal mismatch from success',()=>{
+ const f=reportFacts({scope,workflow:'Human gate: none',observed:[{id:'a',state:'terminal-unreconciled',role:'Builder',startedAt:1000},{id:'b',state:'silence-unverified'},{id:'c',state:'permission-wait'}]},progress);
+ const out=renderReport(f,prose,19*3600000+1000);assert.match(out,/завершения хода или задания/);assert.match(out,/зависание не доказано/);assert.match(out,/ожидают разрешения/);assert.match(out,/Разработчик: с начала наблюдения прошло 19 ч 0 мин/);
+});
+
+test('finite delivery separates external proof, legacy closed reconciliation and optional observation from engineering',()=>{
+ const s={...scope,tasks:[...scope.tasks,{id:'parked',title:'Проверка внешнего оборудования',status:'WAITING_EXTERNAL',queue_position:9,execution_state:'delivered_awaiting_evidence'},{id:'unchecked',title:'Старый релиз',status:'VERIFIED'},{id:'optional',title:'Оценка естественности',status:'VERIFIED'}]};
+ const d={done:2,total:7,external_evidence_task_ids:['parked'],reconcile_task_ids:['unchecked'],optional_observation_task_ids:['optional']};
+ const facts=reportFacts({scope:s,workflow:'Human gate: none'},{...progress,engineering_delivery:d});
+ const t=renderReport(facts,{degraded:true});
+ assert.match(t,/Инженерно завершено[^\n]*2\/7/);
+ const [queue,external]=t.split('**Доставлено, ожидаются обязательные внешние доказательства');
+ assert.match(queue,/Полная очередь \(3\)/);assert.doesNotMatch(queue,/Проверка внешнего оборудования|Старый релиз|Оценка естественности/);
+ assert.match(external,/Проверка внешнего оборудования/);assert.match(external,/Сверка ранее заявленной доставки/);assert.match(external,/Старый релиз/);assert.match(external,/Необязательное наблюдение после выпуска/);assert.match(external,/Оценка естественности/);
+ const unknown=renderReport(reportFacts({scope:s,workflow:''},{...progress,measurable:false,stale_sources:['changed'],engineering_delivery:d}),{});
+ assert.match(unknown,/Полная очередь \(4\)/);assert.doesNotMatch(unknown,/Доставлено, ожидаются обязательные внешние доказательства/);
 });

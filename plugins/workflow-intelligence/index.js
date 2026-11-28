@@ -1,6 +1,5 @@
 import fs from "node:fs/promises"
 import path from "node:path"
-import os from "node:os"
 import crypto from "node:crypto"
 import { fileURLToPath } from "node:url"
 
@@ -8,7 +7,6 @@ const PLUGIN_ID = "workflow.intelligence"
 const MANAGED_BY = "opencode-global-intelligence-v3"
 const here = path.dirname(fileURLToPath(import.meta.url))
 const backend = path.join(here, "workflow_intel.py")
-const initializedScratch = new Set()
 
 // Single portable storage root: derived from the installed global plugin location.
 // Never derive workflow files from the current repository's parent or system temp.
@@ -68,7 +66,6 @@ async function ensureScratch(repo) {
   // No TTL-based cleanup. Shared tmp/lanes/pycache may be retired only after
   // all project consumers are idle via workflow_housekeeping.py shared-scratch-close.
   // Do not delete reusable repository indexes after each task.
-  initializedScratch.add(root)
 
   return { root, tmp, lanes, pycache }
 }
@@ -126,8 +123,13 @@ async function runBackend(repo, args) {
         proc.exited,
       ])
       if (code === 0) return stdout.trim()
-      failures.push(`${prefix.join(" ")}: exit ${code}: ${stderr.trim() || stdout.trim()}`)
+      // An actual backend failure is not a missing Python executable. Do not
+      // retry indexing or a stateful baseline action with another interpreter.
+      throw Object.assign(new Error(`${prefix.join(" ")}: exit ${code}: ${stderr.trim() || stdout.trim()}`), { backendRan: true })
     } catch (error) {
+      if (error?.backendRan) throw error
+      // Bun may throw on launch; only a proven missing executable permits fallback.
+      if (!/ENOENT|not found|No such file|unable to find executable/i.test(String(error?.code ?? '') + ' ' + String(error))) throw error
       failures.push(`${prefix.join(" ")}: ${String(error)}`)
     }
   }
@@ -154,7 +156,7 @@ function makeToolDefinition(ctx) {
   return {
   name: "workflow_intel",
   description:
-    "Global repository intelligence and maintenance cache. Git-incremental SQLite + Python AST/light structural index, feature-manifest context/validation, test lifecycle audit, and managed scratch status. Use before broad repository rediscovery; current code/runtime remain authoritative.",
+    "Global repository intelligence and maintenance cache. Git-incremental SQLite + Python AST/light structural index, feature-manifest context/validation, test lifecycle audit, and managed scratch status. Optional navigation and diagnostics; use when helpful, never as an execution or acceptance gate. Current code/runtime remain authoritative.",
   input: {
     type: "object",
     properties: {

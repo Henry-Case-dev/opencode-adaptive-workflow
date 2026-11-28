@@ -29,7 +29,8 @@ export function readMachineHeader(workflowText) {
   if((fields['human gate']?.length??0)!==1)
     return {ok:false,reason:(fields['human gate']?.length??0)>1?'human-gate-duplicate':'human-gate'};
   const human=machineValue(fields['human gate'][0]);
-  if(human!=='none')return {ok:false,reason:'human-gate'};
+  const scoped=fields['human gate'][0].match(/^task\s*\(([^()\r\n]+)\)$/i);
+  if(human!=='none'&&!scoped)return {ok:false,reason:'human-gate'};
   const statuses=(fields.status??[]).map(machineValue);
   const executions=(fields['next execution']??[]).map(machineValue);
   const knownStatuses=new Set(['in_progress','done','waiting_external','blocked']);
@@ -40,89 +41,86 @@ export function readMachineHeader(workflowText) {
     return {ok:false,reason:'workflow-not-active'};
   if(!executions.length||executions.some(x=>!knownExecutions.has(x)))
     return {ok:false,reason:'next-execution-missing-or-invalid'};
-  return {ok:true,human,status:statuses.length===1?statuses[0]:null,
+  return {ok:true,human,gateTask:scoped?.[1].trim()??null,status:statuses.length===1?statuses[0]:null,
     nextExecution:executions.length===1?executions[0]:null,
     inconsistent:statuses.length!==1||executions.length!==1,
     duplicates:{status:statuses.length,execution:executions.length}};
 }
 
 const ACTIONABLE=new Set(['PENDING','PLANNED','READY','PREPARING','BUILDING','IN_PROGRESS',
-  'REVIEW','REVIEWING','DELIVERY','DEPLOYING','READY_FOR_LIVE','FAILED',
+  'REVIEW','REVIEWING','DELIVERY','DEPLOYING','READY_FOR_LIVE','READY_TO_SHIP','FAILED',
   'NEEDS_FIXES','TO_DO','TODO']);
-const NEW_READY=new Set(['PENDING','PLANNED','READY','PREPARING','TO_DO','TODO']);
-const DEPENDENCY_SATISFIED=new Set(['VERIFIED','DONE','COMPLETED']);
-
-/** A narrow proof of queued, unblocked engineering work. Not dispatch authority. */
-export function certifiedReadyQueueIds(scope) {
-  if (!Array.isArray(scope?.tasks) || !scope.tasks.length) return [];
-  const ids=new Map(),positions=new Set(),ready=[];
-  for(const row of scope.tasks){
-    if(!row||typeof row.id!=='string'||!row.id.trim()||ids.has(row.id)||
-      typeof row.status!=='string')return [];
-    const status=row.status.trim().toUpperCase();
-    if(!TERMINAL.has(status)&&!PASSIVE.has(status)&&!ACTIONABLE.has(status))return [];
-    ids.set(row.id,row);
-    if(TERMINAL.has(status)||PASSIVE.has(status))continue;
-    if(Number.isSafeInteger(row.queue_position)&&row.queue_position>0){
-      if(positions.has(row.queue_position))return [];
-      positions.add(row.queue_position);
-    }
+const NEW_READY=new Set(['PENDING','PLANNED','READY','PREPARING','READY_TO_SHIP','NEEDS_FIXES','TO_DO','TODO']);
+const LEGACY_CLOSED=new Set(['VERIFIED','COMPLETED']);
+const excluded=new Set(['CANCELLED','USER_EXCLUDED','N/A_WITH_REASON']);
+const statusOf=r=>String(r?.status??'').trim().toUpperCase();
+const nonempty=v=>typeof v==='string'&&!!v.trim();
+// Compact closure is a recorded historical delivery, not a current runtime probe.
+// Evidence is validated at close; neither current HEAD nor mutable plan hashes are inputs.
+export function deliveryRecorded(row){
+  const d=row?.delivery;
+  if(!d||typeof d!=='object'||Array.isArray(d)||!['deployment','non_deployment'].includes(d.kind))return false;
+  if(typeof d.candidate!=='string'||!/^(?:[0-9a-f]{40}|[0-9a-f]{64})$/i.test(d.candidate))return false;
+  const ref=x=>typeof x==='string'&&/^(?:[0-9a-f]{40}|[0-9a-f]{64}):[^\r\n]+$/i.test(x);
+  if(!ref(d.review_ref)||!ref(d.delivery_ref)||!nonempty(d.result))return false;
+  if(d.kind==='deployment' ? d.deployed_commit!==d.candidate : d.deployed_commit!=null)return false;
+  const deferred=Object.hasOwn(d,'deferred_req_ids')?d.deferred_req_ids:[];
+  return Array.isArray(deferred)&&deferred.every(nonempty)&&new Set(deferred).size===deferred.length;
+}
+export function closed(row){return LEGACY_CLOSED.has(statusOf(row))||(statusOf(row)==='DONE'&&deliveryRecorded(row));}
+const priorityOf=v=>typeof v==='string'&&/^P[0-9]$/i.test(v)?Number(v[1]):Number.isInteger(v)&&v>=0&&v<=9?v:null;
+const posOf=v=>Number.isSafeInteger(v)&&v>0?v:Number.MAX_SAFE_INTEGER;
+export function taskIndex(scope){
+  const ids=new Map(),duplicates=new Set();
+  for(const row of Array.isArray(scope?.tasks)?scope.tasks:[]){
+    if(!row||!nonempty(row.id))continue;
+    if(ids.has(row.id))duplicates.add(row.id);else ids.set(row.id,row);
   }
-  for(const row of scope.tasks){
-    const status=row.status.trim().toUpperCase();
-    if(!NEW_READY.has(status))continue;
-    if(!Number.isSafeInteger(row.queue_position)||row.queue_position<=0)continue;
-    if(!((typeof row.priority==='string' && /^P[0-9]$/i.test(row.priority)) ||
-         (Number.isInteger(row.priority)&&row.priority>=0&&row.priority<=9)))continue;
+  for(const id of duplicates)ids.delete(id);
+  return ids;
+}
+function intakeTargets(scope){
+  const inputs=Array.isArray(scope?.owner_inputs)?scope.owner_inputs:[];
+  return new Set(inputs.filter(x=>x?.reconciled===false&&Array.isArray(x.target_task_ids)).flatMap(x=>x.target_task_ids));
+}
+/** Local quarantine: malformed records/edges never license dispatch of that task.
+ * Position is ordering metadata, not a permission or global execution gate. */
+export function certifiedReadyQueueIds(scope){
+  if(scope?.schema!=='openworkflow-progress-scope-v1'||!Array.isArray(scope.tasks))return [];
+  const ids=taskIndex(scope),pending=intakeTargets(scope),ready=[];
+  for(const row of ids.values()){
+    const status=statusOf(row),priority=priorityOf(row.priority);
+    if(!NEW_READY.has(status)||priority===null||pending.has(row.id))continue;
     if(!Array.isArray(row.blocked_by)||new Set(row.blocked_by).size!==row.blocked_by.length)continue;
-    // Historical blocker edges remain in some old queue entries. Clear only
-    // dependencies with a *verified* terminal task; missing or externally
-    // documented blocker IDs and CANCELLED tasks remain blocking.
-    if(row.blocked_by.some(id=> typeof id!=='string'||
-      !DEPENDENCY_SATISFIED.has(String(ids.get(id)?.status??'').trim().toUpperCase())))continue;
-    if(['delivered_awaiting_evidence','waiting_external','blocked','running','assigned'].includes(
-       String(row.execution_state??'').toLowerCase()))continue;
-    ready.push({id:row.id,position:row.queue_position});
+    if(row.blocked_by.some(id=>!nonempty(id)||pending.has(id)||!closed(ids.get(id))))continue;
+    if(['delivered_awaiting_evidence','waiting_external','blocked','running','assigned'].includes(String(row.execution_state??'').toLowerCase()))continue;
+    ready.push({id:row.id,priority,position:posOf(row.queue_position)});
   }
-  ready.sort((a,b)=>a.position-b.position);
+  ready.sort((a,b)=>a.priority-b.priority||a.position-b.position||(a.id<b.id?-1:a.id>b.id?1:0));
   return ready.map(x=>x.id);
 }
 export function evaluateWork(scope, workflowText) {
-  if (!scope || scope.schema !== 'openworkflow-progress-scope-v1' ||
-      !Array.isArray(scope.tasks) || !scope.tasks.length)
+  if (!scope || scope.schema !== 'openworkflow-progress-scope-v1' || !Array.isArray(scope.tasks))
     return {ok:false,reason:'missing-or-empty-workflow-scope'};
-  if(scope.tasks.some(t=>!t||typeof t.id!=='string'||!t.id.trim()||typeof t.status!=='string'))
-    return {ok:false,reason:'invalid-task-status'};
-  if(scope.tasks.some(t=>{
-    const status=t.status.trim().toUpperCase();
-    return !TERMINAL.has(status)&&!PASSIVE.has(status)&&!ACTIONABLE.has(status);
-  }))return {ok:false,reason:'unknown-task-status'};
   const header=readMachineHeader(workflowText);
   if(!header.ok)return {ok:false,reason:header.reason};
-  const certifiedReady=certifiedReadyQueueIds(scope);
-  // The queue is canonical for whether a next *independent* task exists; a
-  // stale 'done'/'none'/'awaiting_children' (or duplicate header) is only a
-  // checkpoint discrepancy. Never bypass an actual human gate or child barrier.
-  const rescueHandoff=certifiedReady.length>0&&
-    (header.inconsistent||header.status!=='in_progress'||header.nextExecution!=='runnable');
-  if(header.inconsistent&&!rescueHandoff){
-    const reason=header.duplicates.status===1&&header.status===null?'workflow-not-active':
-      header.duplicates.execution===0||header.duplicates.execution===1&&!['runnable','awaiting_children','none'].includes(header.nextExecution)
-        ?'next-execution-missing-or-invalid':
-      'checkpoint-ambiguous-no-certified-ready-work';
-    return {ok:false,reason};
+  const ids=taskIndex(scope),certifiedReady=certifiedReadyQueueIds(scope);
+  const pending=(Array.isArray(scope.owner_inputs)?scope.owner_inputs:[]).some(x=>x?.reconciled===false&&nonempty(x.id));
+  if(header.gateTask){
+    const gateRow=ids.get(header.gateTask);
+    if(!gateRow||!PASSIVE.has(statusOf(gateRow))||!certifiedReady.length||certifiedReady.includes(header.gateTask))return {ok:false,reason:'human-gate'};
   }
-  if(header.status==='done'&&!rescueHandoff)
-    return {ok:false,reason:'workflow-not-active'};
-  if(header.nextExecution==='none'&&!rescueHandoff)
-    return {ok:false,reason:'no-runnable-transition'};
-  const statuses=scope.tasks.map(t=>t.status.trim().toUpperCase());
-  const count=statuses.filter(s=>ACTIONABLE.has(s)).length;
-  if(!count)return {ok:false,reason:'no-actionable-work'};
+  const rescueHandoff=(certifiedReady.length>0||pending&&!header.gateTask)&&
+    (header.inconsistent||header.status!=='in_progress'||header.nextExecution!=='runnable'||!!header.gateTask);
+  if(header.inconsistent&&!rescueHandoff)return {ok:false,reason:'checkpoint-ambiguous-no-certified-ready-work'};
+  if(header.status==='done'&&!rescueHandoff)return {ok:false,reason:'workflow-not-active'};
+  if(header.nextExecution==='none'&&!rescueHandoff)return {ok:false,reason:'no-runnable-transition'};
+  const count=[...ids.values()].filter(r=>ACTIONABLE.has(statusOf(r))||statusOf(r)==='DONE'&&!closed(r)).length;
+  if(!count&&!pending)return {ok:false,reason:'no-actionable-work'};
   return {ok:true,reason:rescueHandoff?'queue-handoff-needed':'actionable-work',count,
     mode:rescueHandoff?'runnable':header.nextExecution,
-    ...(rescueHandoff?{certifiedReady}:{}),
-    ...(header.inconsistent?{checkpointInconsistent:true}: {})};
+    ...(rescueHandoff?{certifiedReady}:{}),...(header.gateTask?{gateTask:header.gateTask}:{}),
+    ...(header.inconsistent?{checkpointInconsistent:true}:{})};
 }
 export function sessionMatches(info,id,repo,agentId) {
   if (!info || info.id !== id || info.parentID) return false;
@@ -148,7 +146,7 @@ export function fingerprint(scope) {
   // Deliberately exclude workflow_state.md, Git HEAD, timestamps and reports:
   // prose checkpoints and documentation commits are NOT proof that real work
   // advanced. Only actual task/intake transitions reset the retry budget.
-  const tasks = scope.tasks.map(t => `${t.id}:${String(t.status).trim().toUpperCase()}`).sort();
+  const tasks = [...taskIndex(scope).values()].map(t => [t.id,statusOf(t),closed(t),t.execution_state??null,t.delivery?.candidate??null,t.candidate_commit??null,Array.isArray(t.blocked_by)?[...t.blocked_by].sort():null]).sort((a,b)=>a[0]<b[0]?-1:a[0]>b[0]?1:0);
   const admitted = certifiedReadyQueueIds(scope).sort();
   const inputs = (Array.isArray(scope.owner_inputs) ? scope.owner_inputs : [])
     .map(i => `${i?.id || ''}:${i?.reconciled === true ? 'reconciled' : 'open'}`).sort();

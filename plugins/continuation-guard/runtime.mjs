@@ -1,5 +1,5 @@
 /**
- * OpenCode V2 continuation guard (v4.11). Opts in implicitly only through a real primary
+ * OpenCode V2 continuation guard (v5.0). Opts in implicitly only through a real primary
  * Orchestrator MODEL CONTEXT hook; NEVER parses user text or starts stale sessions.
  * Uses V2 session.execution.* lifecycle, not deprecated session.idle.
  */
@@ -8,18 +8,17 @@ import path from 'node:path';
 import os from 'node:os';
 import crypto from 'node:crypto';
 import { normalizePath, evaluateWork, sessionMatches, eventSessionId, eventReason,
-  safePermissionCount, fingerprint, assessAttempt, positiveInt } from './core.mjs';
-import {safeMcpEventSources,acceptMcpEventSignal} from './mcp-events.mjs';
+  safePermissionCount, fingerprint, assessAttempt, positiveInt, certifiedReadyQueueIds } from './core.mjs';
 import {createReporter,readReportState,publishedReport,containsReport} from './report.mjs';
 import {createTelemetry} from './telemetry.mjs';
 
-const RESUME_TEXT = 'Автоматическое продолжение уже активной рабочей сессии после неожиданного завершения хода. Это не новое задание и не разрешение на Human Gate. Сверь каноническую durable-очередь, реальные Assignment/child/job, Git и ревью; не повторяй завершённое. Если предыдущий релиз DONE, но есть подтверждённая независимая готовая задача, проверь и атомарно исправь устаревший/дублирующийся машинный заголовок workflow_state.md через установленный workflow_checkpoint.py (inspect + SHA compare-and-apply) без изменения исходников и иных планов. Настоящий Human Gate и живой/неизвестный исполнитель неприкосновенны. Выполни безопасный следующий переход до отчёта, не создавая дублей. Не производи неразрешённых внешних действий. Отчитайся простым русским языком.';
+const RESUME_TEXT = 'Автопродолжение текущей сессии, не новое поручение и не разрешение. Сверь каноническую очередь и реальные Assignment/child/job; используй уже полученные результаты. Назначь следующую безопасную работу по всей очереди, даже если предыдущий релиз завершён или другая задача ждёт владельца. Не повторяй историческую приёмку без конкретного дефекта. Уточни только мешающие записи. Не обходи реальные разрешения, не дублируй исполнителей, не пиши тестовые сообщения в рабочие чаты. Сначала продвижение работы, затем полный отчёт.';
 const defaults = Object.freeze({enabled:false,pollMs:20000,minIdleMs:60000,cooldownMs:90000,
-  maxAttemptsWithoutProgress:2,maxIdleAgeHours:8,dryRun:false,sessionLeaseHours:36,agent:'Orchestrator',reportEnabled:true});
+  maxAttemptsWithoutProgress:2,maxIdleAgeHours:8,dryRun:false,sessionLeaseHours:36,agent:'Orchestrator',reportEnabled:true,livenessSilenceMinutes:30});
 const empty = () => ({version:4,armedSessionId:null,agent:null,armedUntil:0,
   lastStartedAt:0,lastSucceededAt:0,lastAttemptForEnd:0,lastAttemptAt:0,
-  childSessions:{},childCoverage:false,childCoverageReason:null,mcpEventsSeen:[],
-  attempts:0,signature:null,suspended:false,pendingOwnerPrompt:false,reportRepair:null});
+  childSessions:{},childCoverage:false,childCoverageReason:null,
+  attempts:0,signature:null,suspended:false,pendingOwnerPrompt:false,livenessNotices:{}});
 
 function safeError(e){return String(e?.message ?? e).slice(0,300)}
 async function readJson(file){try{return JSON.parse(await fs.readFile(file,'utf8'))}catch{return null}}
@@ -50,20 +49,37 @@ export async function startGuard(ctx,{pluginDir,logger,now=()=>Date.now(),setInt
   let eventController=new AbortController();
   let automaticPromptInFlight=false;
   const runningChildren=new Set();
+  // Runtime observations only. No elapsed-time cancellation or invented terminal state.
+  let nativeIdleFor=null;
+  const terminalStates=new Set(['succeeded','failed','interrupted','quiescent']);
+  const incidentKey=(id,r,kind)=>crypto.createHash('sha256').update(JSON.stringify([s.armedSessionId,id,r.startedAt??r.at??0,kind])).digest('hex');
+  const liveState=(r)=>r.diagnosis??r.state??'observed';
+  function rememberChild(id,extra={}){
+    const children=s.childSessions??(s.childSessions={});
+    const r=children[id]??(children[id]={state:'observed',at:now(),startedAt:now(),activityAt:now()});
+    Object.assign(r,extra);return r;
+  }
+  function activity(id,type){
+    const r=s.childSessions?.[id];if(!r||terminalStates.has(r.state)||r.state==='missing')return;
+    if(/^(session\.(step|tool|text|reasoning|compaction)\.|session\.retry\.scheduled)/.test(type)){
+      r.activityAt=now();delete r.diagnosis;
+    }
+  }
+
   let lastConfig=null;
   const repoHash=stateKey.slice(-12);
   const loadedAt=now();
   const logEvent=(event,detail={})=>log(event,{project:repoHash,...detail});
   // Reporting state is ephemeral output, never a second queue or liveness proof.
-  let reportRoot=null,reportCandidate=null,reportModel=null,reportBoundary=null,reportEpoch=0,reportCorrection=false,lastPublishedMessage=null;
+  let reportRoot=null,reportCandidate=null,reportModel=null,reportBoundary=null,reportEpoch=0,lastPublishedMessage=null;
   const telemetry=createTelemetry(now);
   const reportTexts=new Map();
-  let reportVerifyInFlight=null,reportAdmissionInFlight=false;
+  let reportVerifyInFlight=null;
   const seenRootStarts=new Set();
   function advanceReportBoundary(){reportEpoch++;reportBoundary=null;reportTexts.clear();}
-  const reportObserved=()=>Object.entries(s.childSessions??{}).map(([id,r])=>({id,state:r?.state??'observed'}));
+  const reportObserved=()=>Object.entries(s.childSessions??{}).filter(([,r])=>!r.waitConfirmed||!!r.diagnosis||(r.at??0)>=s.lastStartedAt).map(([id,r])=>({id,state:liveState(r),role:r.role??null,startedAt:r.startedAt??r.at??null}));
   const reporter=createReporter(ctx,{repo,pluginDir,now,log:logEvent,getRoot:()=>reportCandidate,getModel:()=>reportModel,getBoundary:()=>reportEpoch,getObserved:reportObserved});
-  const reportInstruction='REPORT CONTRACT v3.5.4: First dispatch all safe ready engineering work and persist the real checkpoint. Before EVERY substantive status, release answer or wait/idle boundary call workflow_report via the available native tool/Code Mode. Pass the verified canonical planning root. Publish its entire returned report verbatim in the primary assistant message, including Публикация receipt, retaining EVERY original line break, blank paragraph and Markdown bullet. The report is your entire visible status reply: no preface, own rewrite, summary, diagnostics or additional technical text. Never collapse the progress or queue into a paragraph, even when unchanged. Preserve every bold source-heading prefix or labeled registry ID beside the readable task name. EVERY wait boundary must publish a complete report even if revision or queue is unchanged. Deduplication only applies to background translation, NEVER publication. Do not decide whether an identical report is redundant; no delta-only substitute. Do not create a Reporter session or do separate arithmetic, clock, or status-only commits. If the tool is unavailable, give the full Russian degraded report with unknown values; never block engineering or fabricate proof. This is reporting only, not authority to dispatch/deploy.';
+  const reportInstruction='REPORT CONTRACT: first dispatch safe work and persist actual queue state. At each primary status/release/wait call workflow_report for the canonical root; publish its entire Russian result verbatim, all lines, prefixes, lists and receipt. Do not regenerate, condense or omit unchanged queue. Reporting is not a gate: if unavailable, show current facts and uncertainty, never stop or repeat engineering for formatting. Historical closure is not new production verification. No extra Reporter session or report-only commits.';
   function injectReportInstruction(event){if(Array.isArray(event.system)&&reportRegistration)event.system.push({type:'text',text:reportInstruction});}
   async function verifyReportBoundary(id,{allowRepair=false}={}){
     if(!reportRegistration||reportRoot!==id||disposed||s.suspended||s.pendingOwnerPrompt)return;
@@ -92,27 +108,13 @@ export async function startGuard(ctx,{pluginDir,logger,now=()=>Date.now(),setInt
           reportBoundary=epoch;lastPublishedMessage=published;await logEvent('report-published',{sessionId:id,boundary:epoch});return;
         }
         await logEvent('report-missing-or-unverified',{sessionId:id,boundary:epoch,prepared:!!expected});
-        // Repair never overrides execution safety; at most one per material
-        // checkpoint, not a new synthetic turn on each reporting-only failure.
+        if(allowRepair)reportBoundary=epoch;
+        // Observability must not create an extra model turn.
         if(!allowRepair)return;
-        reportBoundary=epoch;
-        const skip=reason=>logEvent('report-repair-skipped',{sessionId:id,boundary:epoch,reason});
-        if(reportCorrection||checking||automaticPromptInFlight||reportAdmissionInFlight||typeof ctx.session.synthetic!=='function'||s.armedSessionId!==id){await skip('not-armed-or-already-corrected');return;}
-        const state=await readReportState(repo);if(!valid())return;
-        const repairKey=crypto.createHash('sha256').update(JSON.stringify([id,state.revision,reportObserved().map(x=>[x.id,x.state]).sort()])).digest('hex');
-        if(s.reportRepair===repairKey){await skip('already-attempted');return;}
-        const decision=evaluateWork(state.scope,state.workflow);
-        if(!decision.ok||decision.mode!=='awaiting_children'){await skip(decision.reason??decision.mode??'not-awaiting');return;}
-        const perms=await bounded(ctx.permission.list({sessionID:id}),8000,'report-permissions');
-        if(safePermissionCount(perms)!==0||!valid()){await skip('permission-or-session-barrier');return;}
-        const latest=await readReportState(repo);if(latest.revision!==state.revision||!valid()||checking||automaticPromptInFlight||reportAdmissionInFlight)return;
-        reportAdmissionInFlight=true;
-        try{
-        s.reportRepair=repairKey;reportCorrection=true;await save();if(!valid())return;
-        const msgID=`msg_${crypto.createHash('sha256').update(`report-contract:${repairKey}`).digest('hex').slice(0,24)}`;
-        await bounded(ctx.session.synthetic({sessionID:id,id:msgID,delivery:'queue',resume:true,text:'Служебное восстановление Report Contract: пропущен полный отчёт. Это НЕ поручение и НЕ разрешение на действия. Только вызови workflow_report и опубликуй весь результат в основной ленте, включая отметку Публикация и все оригинальные переносы строк. Каждая задача — отдельная строка списка. Не переписывай текст и не дополняй техническими данными, даже если ревизия та же. Не меняй очередь и не запускай агентов ради отчёта. Настоящие результаты агентов и безопасная инженерная работа имеют приоритет.'}),10000,'report-synthetic');
-        await logEvent('report-repair-admitted',{sessionId:id,boundary:epoch});
-        }finally{reportAdmissionInFlight=false;}
+        // V4: publishing is mandatory in normal turns, but report repair never
+        // starts a second model turn or competes with engineering recovery.
+        await logEvent('report-repair-skipped',{sessionId:id,boundary:epoch,reason:'next-normal-turn'});return;
+
       }catch{await logEvent('report-boundary-unverified',{sessionId:id,boundary:epoch});}
     })();
     try{await job.promise;}finally{if(reportVerifyInFlight===job)reportVerifyInFlight=null;}
@@ -127,12 +129,12 @@ export async function startGuard(ctx,{pluginDir,logger,now=()=>Date.now(),setInt
       maxIdleAgeMs:positiveInt(v.maxIdleAgeHours,8,1,168)*3600000,
       leaseMs:positiveInt(v.sessionLeaseHours,36,1,168)*3600000,
       agent:String(v.agent||'Orchestrator'),dryRun:v.dryRun===true,reportEnabled:v.reportEnabled!==false,
-      mcpEventSources:safeMcpEventSources(v.mcpEventSources)};
+      livenessSilenceMs:positiveInt(v.livenessSilenceMinutes,30,5,1440)*60000};
   }
   async function save(){await ctx.storage.set(stateKey,s)}
   async function clear(reason){
     if(!s.armedSessionId)return;
-    const id=s.armedSessionId;s=empty();runningChildren.clear();await save();
+    const id=s.armedSessionId;s=empty();runningChildren.clear();nativeIdleFor=null;await save();
     await logEvent('disarmed',{sessionId:id,reason});
   }
   async function eligibility(){
@@ -177,20 +179,15 @@ export async function startGuard(ctx,{pluginDir,logger,now=()=>Date.now(),setInt
       // An interrupt can re-arm only after a new EXTERNAL user admission.
       if(s.suspended && !s.pendingOwnerPrompt)return;
       const fresh=s.armedSessionId!==id;
-      if(fresh){s=empty();runningChildren.clear();}
-      if(reportRoot!==id){reporter.reset();reportRoot=id;advanceReportBoundary();reportCorrection=false;lastPublishedMessage=null;}
+      if(fresh){s=empty();runningChildren.clear();nativeIdleFor=null;}
+      if(reportRoot!==id){reporter.reset();reportRoot=id;advanceReportBoundary();lastPublishedMessage=null;}
       if(cfg.reportEnabled&&!cfg.dryRun){injectReportInstruction(event);void reporter.prewarm(id,reportEpoch);}
-      if(!fresh&&s.childSessions){
-        // A new actual primary model turn is the natural handoff boundary.
-        // Retire only terminal child observations, never live/unknown work.
-        for(const [child,record] of Object.entries(s.childSessions)){
-          if(['succeeded','failed','interrupted','quiescent'].includes(record?.state))
-            delete s.childSessions[child];
-        }
-      }
+      // Retain terminal observations for this root: paginated inventory may
+      // include old sessions forever. Removing them would turn every old
+      // successful wait into a new completion notice.
       s.armedSessionId=id;s.agent=cfg.agent;s.armedUntil=t+cfg.leaseMs;
       // An actual primary model call is strong proof that this execution started.
-      s.lastStartedAt=t;s.lastSucceededAt=0;
+      s.lastStartedAt=t;s.lastSucceededAt=0;nativeIdleFor=null;
       s.suspended=false;s.pendingOwnerPrompt=false;
       // The started event is authoritative for busy; context may precede it.
       await save();
@@ -202,8 +199,8 @@ export async function startGuard(ctx,{pluginDir,logger,now=()=>Date.now(),setInt
     const id=event?.sessionID??event?.sessionId;
     if(!id||id!==s.armedSessionId||automaticPromptInFlight)return;
     // Structural observation only: DO NOT read event.prompt.text.
-    s.pendingOwnerPrompt=true;
-    reportCorrection=false;advanceReportBoundary();
+    s.pendingOwnerPrompt=true;nativeIdleFor=null;
+    advanceReportBoundary();
     // A new external prompt supersedes any assumed idle continuation.
     s.lastSucceededAt=0;
     await save();
@@ -215,29 +212,36 @@ export async function startGuard(ctx,{pluginDir,logger,now=()=>Date.now(),setInt
   async function trackChild(event,id,type){
     if(!s.armedSessionId || !id || id===s.armedSessionId)return false;
     const p=event?.properties??event?.data??{};
-    let parent=p.info?.parentID??p.parentID??null;
+    let parent=p.info?.parentID??p.parentID??null;let childRole=p.info?.agent??p.agent;
     if(!parent && s.childSessions?.[id])parent=s.armedSessionId;
     if(!parent){
       try{const info=await bounded(ctx.session.get({sessionID:id}),4000,'child-get');
-        parent=(info?.data??info)?.parentID??null;}
+        parent=(info?.data??info)?.parentID??null;childRole=(info?.data??info)?.agent??childRole;}
       catch{return false;}
     }
     if(parent!==s.armedSessionId)return false;
     const children=s.childSessions??(s.childSessions={});
-    const prev=children[id]??{state:'observed',at:now()};
+    const prev=children[id]??{state:'observed',at:now(),startedAt:now(),activityAt:now()};
     let state=prev.state;
     if(type==='session.execution.started')state='running';
     if(type==='session.execution.succeeded')state='succeeded';
     if(type==='session.execution.failed')state='failed';
     if(type==='session.execution.interrupted')state='interrupted';
     if(type==='session.deleted')state='missing';
-    children[id]={...prev,state,at:now()};
+    // Duplicate terminal/start events do not reset the incident clock. A new
+    // start after a terminal turn is a new observation, not a completion proof.
+    if(state!==prev.state){
+      children[id]={...prev,state,at:now(),activityAt:now(),waitConfirmed:false};
+      delete children[id].diagnosis;
+      if(state==='running'){children[id].startedAt=now();children[id].everPending=false;delete children[id].reconciledAt;delete children[id].jobStatus;delete children[id].jobAt;delete children[id].jobID;}
+    }else children[id]=prev;
+    if(typeof childRole==='string'&&/^(Builder|Reviewer|Architect|PM|DevOps|Memory|Arbiter)$/i.test(childRole))children[id].role=childRole;
     if(state!==prev.state&&reportCandidate===s.armedSessionId&&lastConfig?.reportEnabled&&!lastConfig?.dryRun)void reporter.prewarm(reportCandidate,reportEpoch);
     if(state==='running')runningChildren.add(id);
     else if(['succeeded','failed','interrupted','missing'].includes(state))runningChildren.delete(id);
     await save();
     if(['succeeded','failed','interrupted'].includes(state)&&prev.state!==state){
-      reportCorrection=false;
+      
       await logEvent('child-terminal-observed',{sessionId:id,parentID:parent,outcome:state});
       // Keep child identity durable; the existing guard reconciliation checks
       // the authoritative terminal state before any wake/admission.
@@ -247,25 +251,19 @@ export async function startGuard(ctx,{pluginDir,logger,now=()=>Date.now(),setInt
   async function onEvent(event){
     if(disposed)return;
     const type=eventType(event);
-    if(type==='experimental.mcp.event'){
-      // External MCP data is untrusted; only explicitly approved (server,name)
-      // pairs may trigger a read-only reconciliation of the currently armed root.
-      // They can NEVER create an Assignment, start an unarmed session or bypass
-      // Requirements Gate, reviewer, permissions or native child verification.
-      if(!s.armedSessionId || s.suspended || s.pendingOwnerPrompt)return;
-      const cfg=lastConfig??await config();
-      const signal=acceptMcpEventSignal(event,cfg.mcpEventSources,s.mcpEventsSeen);
-      if(!signal.ok)return;
-      s.mcpEventsSeen=signal.seen;
-      await save();
-      await logEvent('mcp-event-reconciliation-signal',{
-        server:signal.server,name:signal.name,truncated:signal.truncated});
-      // Do not enqueue a second prompt here: OpenCode's native
-      // opencode_watch_mcp_event already wakes the subscribed session with a
-      // synthetic external message. The guard only records a bounded signal.
-      // At that native wake Orchestrator must re-verify canonical project state.
-      // This avoids a race between two independent wake-up mechanisms.
-      return;
+    // External MCP events are handled by native OpenCode subscriptions, not this guard.
+    if(type==='experimental.mcp.event')return;
+    // Job updates are hints only; the plugin API is not the public SDK job API.
+    // Never interpret job absence or an unrecognized event as completion.
+    if(type==='experimental.job.updated'){
+      const p=event?.properties??event?.data??{};const j=p.job??p;
+      const jobID=j.jobID??j.id;
+      const child=j.childSessionID??j.childID??j.subagentSessionID??(typeof jobID==='string'?Object.keys(s.childSessions??{}).find(id=>s.childSessions[id].jobID===jobID):null);
+      if(typeof child==='string'&&s.childSessions?.[child]){
+        const r=s.childSessions[child];const status=typeof j.status==='string'?j.status:j.status?.type;
+        if(status&&status!==r.jobStatus){r.jobStatus=status;r.jobAt=now();await save();
+          await logEvent('child-job-signal',{sessionId:child,status});}
+      }
     }
     const id=eventSessionId(event);
     if(!id)return;
@@ -294,6 +292,7 @@ export async function startGuard(ctx,{pluginDir,logger,now=()=>Date.now(),setInt
     if(id===reportRoot&&['session.execution.interrupted','session.execution.failed','session.error','session.deleted'].includes(type)){reporter.reset();reportRoot=null;reportCandidate=null;advanceReportBoundary();telemetry.reset();}
     if(!s.armedSessionId)return;
     if(id!==s.armedSessionId){
+      activity(id,type);
       if(['session.created','session.execution.started','session.execution.succeeded',
         'session.execution.failed','session.execution.interrupted','session.deleted'].includes(type))
         {const tracked=await trackChild(event,id,type);if(tracked&&!isObserved&&type==='session.execution.started')telemetry.observe(type,id,event?.properties??event?.data??{});}
@@ -301,7 +300,7 @@ export async function startGuard(ctx,{pluginDir,logger,now=()=>Date.now(),setInt
     }
     const t=now();
     if(type==='session.execution.started'||(type==='session.status'&&event?.properties?.status?.type==='busy')){
-      s.lastStartedAt=t;s.lastSucceededAt=0;s.armedUntil=t+(lastConfig?.leaseMs??defaults.sessionLeaseHours*3600000);
+      nativeIdleFor=null;s.lastStartedAt=t;s.lastSucceededAt=0;s.armedUntil=t+(lastConfig?.leaseMs??defaults.sessionLeaseHours*3600000);
       await save();return;
     }
     if(type==='session.execution.succeeded'){
@@ -309,7 +308,7 @@ export async function startGuard(ctx,{pluginDir,logger,now=()=>Date.now(),setInt
     }
     // session.idle/status idle is not an authoritative execution result.
     if(type==='session.execution.interrupted'||type==='session.execution.failed'||type==='session.error'){
-      s.suspended=true;s.suspendedAt=t;s.pendingOwnerPrompt=false;s.lastSucceededAt=0;
+      nativeIdleFor=null;s.suspended=true;s.suspendedAt=t;s.pendingOwnerPrompt=false;s.lastSucceededAt=0;
       await save();
       await logEvent('suspended-after-execution-end',{sessionId:id,type,reason:eventReason(event)});
     }
@@ -322,6 +321,7 @@ export async function startGuard(ctx,{pluginDir,logger,now=()=>Date.now(),setInt
     if(disposed)return;
     if(event?.sessionID!==s.armedSessionId){if(event?.sessionID===reportRoot)await verifyReportBoundary(reportRoot);return;}
     if(!Array.isArray(event.background))return;
+    nativeIdleFor={root:event.sessionID,started:s.lastStartedAt};
     let complete=true;
     const children=s.childSessions??(s.childSessions={});
     for(const job of event.background){
@@ -332,8 +332,9 @@ export async function startGuard(ctx,{pluginDir,logger,now=()=>Date.now(),setInt
       const id=job.childSessionID??job.childID??job.subagentSessionID??
         (job.sessionID!==s.armedSessionId?job.sessionID:null);
       if(typeof id!=='string'||!id){complete=false;continue;}
-      children[id]??={state:'observed',at:now()};
+      const record=rememberChild(id);if(typeof job.jobID==='string'&&/^[A-Za-z0-9_-]{1,160}$/.test(job.jobID))record.jobID=job.jobID;
     }
+    s.nativeOtherBackground=!complete;
     s.childCoverage=complete;
     s.childCoverageReason=complete?'native-idle-background':'unidentified-native-background';
     await save();
@@ -346,16 +347,17 @@ export async function startGuard(ctx,{pluginDir,logger,now=()=>Date.now(),setInt
   // unknown work remains UNKNOWN, not completed.
   let lastChildSkip='';
   async function ensureChildrenQuiescent(rootID){
+    const lease=s;const rootStart=s.lastStartedAt;
     const children=new Set([...Object.keys(s.childSessions??{}),...runningChildren]);
     let inventoryComplete=false;
     if(typeof ctx.session.list==='function'){
       let cursor=null;const cursors=new Set();
       for(let pageNo=0;pageNo<12;pageNo++){
-        const params={directory:repo,parentID:rootID,limit:100};
-        if(cursor)params.cursor=cursor;
+        const params=cursor?{cursor,limit:100}:{directory:repo,parentID:rootID,limit:100};
         let response;
         try{response=await bounded(ctx.session.list(params),10000,'list-children')}
         catch{return {ok:false,reason:'child-inventory-error'}}
+        if(s!==lease||s.armedSessionId!==rootID||s.lastStartedAt!==rootStart)return {ok:false,reason:'child-probe-superseded'};
         const rows=Array.isArray(response)?response:
           (response?.items??response?.data?.items??response?.sessions??response?.data?.sessions??
           (Array.isArray(response?.data)?response.data:undefined));
@@ -363,7 +365,7 @@ export async function startGuard(ctx,{pluginDir,logger,now=()=>Date.now(),setInt
         for(const item of rows){
           if(typeof item?.id!=='string'||item.parentID!==rootID)
             return {ok:false,reason:'child-inventory-incomplete-or-mismatch'};
-          children.add(item.id);
+          children.add(item.id);const row=rememberChild(item.id);if(typeof item.agent==='string'&&/^(Builder|Reviewer|Architect|PM|DevOps|Memory|Arbiter)$/i.test(item.agent))row.role=item.agent;
         }
         const next=response?.cursor?.next??response?.data?.cursor?.next??null;
         if(!next){inventoryComplete=true;break;}
@@ -371,21 +373,102 @@ export async function startGuard(ctx,{pluginDir,logger,now=()=>Date.now(),setInt
         cursors.add(next);cursor=next;
       }
     }
-    if(!inventoryComplete && !s.childCoverage)
-      return {ok:false,reason:'child-roster-unverified'};
+    const rosterUnverified=(!inventoryComplete&&!s.childCoverage)||s.nativeOtherBackground;
     const ids=[...children];
+    if(rosterUnverified&&!ids.length)return {ok:false,reason:'child-roster-unverified'};
     if(typeof ctx.session.wait!=='function')return {ok:false,reason:'child-wait-unavailable'};
+    const pending=[];const signals=[];let changed=false;
     for(let start=0;start<ids.length;start+=12){
       const results=await Promise.all(ids.slice(start,start+12).map(async id=>{
-        const ac=new AbortController();
+        const ac=new AbortController();const r=rememberChild(id);const state=r.state;const observedAt=r.at;
         try{await bounded(ctx.session.wait({sessionID:id},{signal:ac.signal}),1800,'child-wait',ac);
-          return {id,ok:true};}
-        catch{return {id,ok:false};}
+          return {id,ok:true,r,state,observedAt};}
+        catch{return {id,ok:false,r,state,observedAt};}
       }));
-      const pending=results.find(r=>!r.ok);
-      if(pending)return {ok:false,reason:'child-still-running-or-unknown',childID:pending.id};
+      if(s!==lease||s.armedSessionId!==rootID||s.lastStartedAt!==rootStart)return {ok:false,reason:'child-probe-superseded'};
+      for(const probe of results){
+        const {id,r,state,observedAt}=probe;
+        if(s.childSessions[id]!==r||r.state!==state||r.at!==observedAt){pending.push(id);continue;}
+        if(probe.ok){
+          if(!r.waitConfirmed||r.diagnosis||runningChildren.has(id)){
+            const hadWork=state==='running'||r.everPending===true||!!r.diagnosis;
+            r.waitConfirmed=true;delete r.diagnosis;runningChildren.delete(id);
+            if(!terminalStates.has(state)&&state!=='missing'){r.state='quiescent';r.at=now();}
+            if(hadWork){r.reconciledAt=now();await logEvent('child-quiescence-reconciled',{sessionId:id,parentID:rootID});}
+            changed=true;
+          }
+          if((r.reconciledAt||['succeeded','failed','interrupted'].includes(r.state))&&r.state!=='missing'&&(Math.max(r.at??0,r.reconciledAt??0))>=s.lastStartedAt)signals.push({id,r,kind:'result-ready'});
+          continue;
+        }
+        pending.push(id);
+        if(!r.everPending){r.everPending=true;changed=true;}
+        r.waitConfirmed=false;
+        // Permission is a real owner dependency; unknown permission status is
+        // never authority to cancel, fence or reassign this worker.
+        const quiet=now()-(r.activityAt??r.at??now());
+        const jobEnded=(r.jobAt??0)>=(r.startedAt??r.at??0)&&['completed','succeeded','failed','cancelled','canceled','interrupted'].includes(r.jobStatus);
+        let diagnosis=(terminalStates.has(state)||jobEnded)?'terminal-unreconciled':quiet>=(lastConfig?.livenessSilenceMs??1800000)?'silence-unverified':null;
+        if(diagnosis){
+          try{const perms=await bounded(ctx.permission.list({sessionID:id}),3000,'child-permission');
+            const n=safePermissionCount(perms);if(n===null)diagnosis='permission-unknown';else if(n>0)diagnosis='permission-wait';}
+          catch{diagnosis='permission-unknown';}
+          if(s!==lease||s.lastStartedAt!==rootStart||s.childSessions[id]!==r||r.state!==state||r.at!==observedAt)return {ok:false,reason:'child-probe-superseded'};
+          if(diagnosis!==r.diagnosis){r.diagnosis=diagnosis;changed=true;await logEvent('child-liveness-anomaly',{sessionId:id,parentID:rootID,diagnosis,quietMs:Math.max(0,quiet)});}
+          if(['terminal-unreconciled','silence-unverified'].includes(diagnosis))signals.push({id,r,kind:diagnosis});
+        }
+      }
     }
-    return {ok:true,observed:ids.length};
+    if(changed){await save();if(reportCandidate===rootID&&lastConfig?.reportEnabled&&!lastConfig?.dryRun)void reporter.prewarm(rootID,reportEpoch);}
+    if(rosterUnverified)return {ok:false,reason:'child-roster-unverified',childID:pending[0],signals};
+    if(pending.length)return {ok:false,reason:'child-still-running-or-unknown',childID:pending[0],signals};
+    return {ok:true,observed:ids.length,signals};
+  }
+  // Separate diagnostic handoff, not a second engineering scheduler. It may
+  // notify an already active root of a result/anomaly while other lanes live.
+  // It never edits plans, cancels a job or authorizes conflicting work.
+  async function notifyLiveness(status,cfg,data,{stale=false}={}){
+    const id=s.armedSessionId,ended=s.lastSucceededAt,started=s.lastStartedAt,lease=s;
+    if(!id||!ended||ended<started||s.suspended||s.pendingOwnerPrompt||cfg.dryRun||typeof ctx.session.synthetic!=='function')return;
+    if(now()-ended<cfg.minIdleMs||automaticPromptInFlight)return;
+    const valid=()=>!disposed&&s===lease&&s.armedSessionId===id&&s.lastStartedAt===started&&s.lastSucceededAt===ended&&!s.suspended&&!s.pendingOwnerPrompt&&s.armedUntil>=now();
+    const signals=(status.signals??[]).filter(x=>!s.livenessNotices?.[incidentKey(x.id,x.r,x.kind)]);
+    // Wake once to reconcile independent ready work even if another child
+    // remains live. This is not a dispatch or permission to touch its scope.
+    const readyIds=certifiedReadyQueueIds(data.scope);
+    const readyKey=readyIds.length&&status.reason==='child-still-running-or-unknown'
+      ?crypto.createHash('sha256').update(JSON.stringify([id,'ready',readyIds,fingerprint(data.scope)])).digest('hex'):null;
+    const readyNotice=readyKey&&!s.livenessNotices?.[readyKey];
+    if(!signals.length&&!readyNotice)return;
+    // A live sibling does not invalidate a completed sibling's result. But a
+    // root still executing is never woken by diagnostics. Native idle is a
+    // snapshot for this exact turn; otherwise require an independent wait.
+    if(nativeIdleFor?.root!==id||nativeIdleFor.started!==started){
+      const ac=new AbortController();try{await bounded(ctx.session.wait({sessionID:id},{signal:ac.signal}),3500,'liveness-root-wait',ac);}catch{return;}
+    }
+    if(!valid())return;
+    const info=await bounded(ctx.session.get({sessionID:id}),10000,'liveness-root-get');
+    if(!sessionMatches(info,id,repo,cfg.agent)||!valid())return;
+    const permissions=await bounded(ctx.permission.list({sessionID:id}),10000,'liveness-root-permissions');
+    if(safePermissionCount(permissions)!==0||!valid())return;
+    const fresh=await eligibility();if(!fresh.decision.ok||fingerprint(fresh.scope)!==fingerprint(data.scope)||!valid())return;
+    const stillCurrent=x=>s.childSessions[x.id]===x.r&&(x.kind==='result-ready'?x.r.waitConfirmed&&!x.r.diagnosis:x.r.diagnosis===x.kind);
+    const current=signals.filter(stillCurrent);
+    if(!current.length&&!readyNotice)return;
+    // Recheck permissions of affected children immediately before admission.
+    for(const x of current){try{if(safePermissionCount(await bounded(ctx.permission.list({sessionID:x.id}),3000,'liveness-child-permission'))!==0)return;}catch{return;}}
+    if(!valid()||!current.every(stillCurrent))return;
+    const latest=await eligibility();if(!latest.decision.ok||fingerprint(latest.scope)!==fingerprint(data.scope)||!valid()||!current.every(stillCurrent))return;
+    const keys=[...current.map(x=>incidentKey(x.id,x.r,x.kind)),...(readyNotice?[readyKey]:[])].sort();
+    s.livenessNotices??={};for(const k of keys)s.livenessNotices[k]=now();
+    // Existing durable state, one notification per observed incident, not a
+    // timer-driven stream of prompts. Keep notices across backend restarts.
+    await save();if(!valid()||!current.every(stillCurrent))return;
+    const requestID=`msg_${crypto.createHash('sha256').update('liveness:'+keys.join(':')).digest('hex').slice(0,24)}`;
+    const details=[...current.map(x=>`${x.id}: ${x.kind}${typeof x.r.jobID==='string'?` (native job ${x.r.jobID})`:''}`),...(readyNotice?['В очереди есть независимые готовые записи; проверь реальные границы записи и разрешения перед назначением.']:[])].join('; ');
+    try{
+      await bounded(ctx.session.synthetic({sessionID:id,id:requestID,delivery:'queue',resume:true,text:`Служебная сверка состояния исполнителей (не поручение владельца): ${details}. Проверь нативное состояние сессии/фонового задания, последний результат и существующий Assignment. result-ready означает только завершение/покой исполнения, не VERIFIED и не подтверждение доставки. terminal-unreconciled — зафиксировано завершение хода или фонового задания, но wait не подтверждает покой; возможны фоновые инструменты. silence-unverified — нет наблюдаемой активности, это не доказательство зависания. Не отменяй по времени, не запускай дубликаты, не удаляй worktree. Если результат уже есть, используй его и обычное ревью. Если доказано, что конкретное фоновое задание осиротело и больше не выполняет никаких действий, используй только реально доступный нативный job API для закрытия; иначе сохрани Assignment и явно сообщи причину. Продолжи независимые готовые задачи только при доказанной непересекающейся области записи и соблюдении действующих разрешений и обязательной технической приёмки. Не жди неизвестного исполнителя, если независимая работа безопасна. Опубликуй обычный полный отчёт.`}),10000,'liveness-synthetic');
+      await logEvent('child-liveness-notice-admitted',{sessionId:id,children:current.map(x=>x.id),stale});
+    }catch(e){await logEvent('child-liveness-notice-unconfirmed',{sessionId:id,message:safeError(e)});}
   }
   async function skipForChildren(rootID){
     const status=await ensureChildrenQuiescent(rootID);
@@ -396,14 +479,14 @@ export async function startGuard(ctx,{pluginDir,logger,now=()=>Date.now(),setInt
     return status;
   }
   async function check(trigger='timer'){
-    if(disposed||checking||reportAdmissionInFlight||!ready)return;
+    if(disposed||checking||!ready)return;
     checking=true;
     try{
       const cfg=await config();lastConfig=cfg;if(!cfg.enabled)return;
       const t=now();
       if(!s.armedSessionId)return;
       if(s.armedUntil<t){await clear('lease-expired');return}
-      if(s.suspended||s.pendingOwnerPrompt)return;
+      if(s.suspended||s.pendingOwnerPrompt||!s.lastSucceededAt||s.lastSucceededAt<s.lastStartedAt)return;
       // Check executable next transition FIRST. Merely having PENDING tasks or
       // an in_progress checkpoint no longer licenses an extra model turn.
       const data=await eligibility();
@@ -411,13 +494,13 @@ export async function startGuard(ctx,{pluginDir,logger,now=()=>Date.now(),setInt
       // The event cache alone CANNOT prove no child is active: it may miss a
       // child started before this plugin loaded or during a stream outage.
       const children=await skipForChildren(s.armedSessionId);
-      if(!children.ok)return;
+      if(!children.ok){await notifyLiveness(children,cfg,data);return;}
       if(data.decision.mode==='awaiting_children' && !children.observed){
         await logEvent('skip-missing-child-evidence',{sessionId:s.armedSessionId});return;
       }
       const sig=fingerprint(data.scope);
       const verdict=assessAttempt(s,sig,cfg,t);
-      if(!verdict.ok){if(verdict.reason==='no-progress-cap' && !s.noProgressLogged){
+      if(!verdict.ok){if(verdict.reason==='stale-idle'){await notifyLiveness(children,cfg,data,{stale:true});return;}if(verdict.reason==='no-progress-cap' && !s.noProgressLogged){
         s.noProgressLogged=true;await save();await logEvent('paused-no-progress',{sessionId:s.armedSessionId,attempts:s.attempts});}
         return;
       }
@@ -497,9 +580,10 @@ export async function startGuard(ctx,{pluginDir,logger,now=()=>Date.now(),setInt
       // Do not reactivate a possibly stale state on startup. Only a newly
       // observed native primary model call can renew its execution lease.
       s.lastSucceededAt=0;s.lastStartedAt=0;s.pendingOwnerPrompt=false;
-      s.childCoverage=false;s.childCoverageReason='backend-restarted';
+      s.childCoverage=false;s.childCoverageReason='backend-restarted';s.nativeOtherBackground=false;nativeIdleFor=null;
       s.childSessions=(s.childSessions&&typeof s.childSessions==='object'&&!Array.isArray(s.childSessions))?s.childSessions:{};
-      s.mcpEventsSeen=Array.isArray(s.mcpEventsSeen)?s.mcpEventsSeen.slice(-96):[];
+      s.livenessNotices=(s.livenessNotices&&typeof s.livenessNotices==='object'&&!Array.isArray(s.livenessNotices))?s.livenessNotices:{};
+      delete s.mcpEventsSeen; delete s.reportRepair;
       await save();
     }
     if(cfg.reportEnabled&&typeof ctx.tool?.transform==='function'){
@@ -530,10 +614,10 @@ export async function startGuard(ctx,{pluginDir,logger,now=()=>Date.now(),setInt
             retries=0;
             await onEvent(event);
           }
-          if(!disposed){telemetry.markGap();s.childCoverage=false;s.childCoverageReason='event-stream-ended';
+          if(!disposed){telemetry.markGap();nativeIdleFor=null;s.childCoverage=false;s.childCoverageReason='event-stream-ended';
             await save();await logEvent('event-stream-ended');}
         }catch(e){
-          if(!disposed){telemetry.markGap();s.childCoverage=false;s.childCoverageReason='event-stream-error';
+          if(!disposed){telemetry.markGap();nativeIdleFor=null;s.childCoverage=false;s.childCoverageReason='event-stream-error';
             await save();await logEvent('event-stream-error',{message:safeError(e)});}
         }
         if(disposed)break;
@@ -548,7 +632,7 @@ export async function startGuard(ctx,{pluginDir,logger,now=()=>Date.now(),setInt
       }
     })();
     timer=setIntervalFn(()=>{void check('timer')},cfg.pollMs);
-    await logEvent('plugin-loaded',{version:'4.11',sessionTracking:'model-context-and-execution-events'});
+    await logEvent('plugin-loaded',{version:'5.0',sessionTracking:'model-context-and-execution-events'});
     return async()=>{
       disposed=true;ready=false;
       if(timer!==null)clearIntervalFn(timer);

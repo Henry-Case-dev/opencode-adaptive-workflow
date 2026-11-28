@@ -240,9 +240,17 @@ def init(args) -> int:
 
 def check(args) -> int:
     p = Path(args.map)
-    data = json.loads(p.read_text(encoding="utf-8"))
+    map_raw = p.read_bytes()
+    data = json.loads(map_raw.decode("utf-8-sig"))
     errors: list[str] = []
     strict = bool(args.strict_evidence or data.get("strict_evidence") is True)
+    nondeployment = getattr(args, "non_deployment", False)
+    receipt_mode = args.stage == "delivery" and strict and not args.slice
+    if nondeployment and (not receipt_mode or args.deployed_commit or data.get("delivery_kind") != "non_deployment" or data.get("deployed_commit") or data.get("delivery_evidence")):
+        errors.append("--non-deployment requires whole-map strict delivery, explicit map delivery_kind=non_deployment, and no declared deployment evidence/commit")
+    if receipt_mode and args.graph:
+        errors.append("delivery receipt requires the canonical graph declared in the map, not an override")
+    receipt_inputs = {}
     if data.get("schema") != "openworkflow-coverage-v1":
         errors.append("unknown map schema")
     sp = Path(data.get("source_path", ""))
@@ -347,6 +355,36 @@ def check(args) -> int:
         validate_graph(str(gp), owners, errors)
     if args.stage == "review" and not args.slice:
         errors.append("review stage requires --slice")
+    if receipt_mode:
+        base = Path(args.repo).resolve()
+        try:
+            def bind_file(target):
+                target = Path(target).resolve()
+                if not target.is_relative_to(base) or not target.is_file():
+                    raise ValueError(f"receipt input missing/outside repo: {target}")
+                key = target.relative_to(base).as_posix()
+                if key not in receipt_inputs:
+                    receipt_inputs[key] = sha(target.read_bytes())
+                return receipt_inputs[key]
+            if bind_file(p) != sha(map_raw) or bind_file(sp) != data.get("source_sha256"):
+                raise ValueError("map/source changed during gate")
+            if graph_ref:
+                bind_file(gp)
+                validate_graph(str(gp), owners, errors)
+            for row in listed + manual:
+                if row.get("disposition") == "required" and optional_owner_check(row):
+                    bind_file(base / row["owner_policy_ref"])
+            # Bind every candidate-bound existing evidence artifact; a proof
+            # that fails strict checks cannot satisfy the gate below.
+            for row in scoped_required + [{"evidence": data.get("delivery_evidence", [])}]:
+                if optional_owner_check(row):
+                    continue
+                for ev in bound_evidence(row, args.candidate, base):
+                    raw_ref = ev.get("artifact_path")
+                    if isinstance(raw_ref, str) and raw_ref and not verify_artifact_issues(base, ev):
+                        bind_file(base / raw_ref)
+        except (OSError, ValueError, TypeError, KeyError) as exc:
+            errors.append(f"delivery receipt: {exc}")
     if args.stage in CANDIDATE_STAGES and not scoped_required:
         errors.append(f"{args.stage} scope has no requirements: {args.slice}")
     if args.stage in {"deploy", "delivery", "release"} and args.slice:
@@ -399,6 +437,8 @@ def check(args) -> int:
             except (OSError, ValueError, KeyError, TypeError) as exc:
                 errors.append(f"scoped release graph cannot be verified: {exc}")
     deferred = []
+    if receipt_mode and not any(not optional_owner_check(row) for row in scoped_required):
+        errors.append("whole-map delivery requires at least one mandatory engineering requirement")
     if args.stage in CANDIDATE_STAGES:
         expected = data.get("candidate_commit")
         if not args.candidate or not expected or args.candidate != expected:
@@ -413,7 +453,9 @@ def check(args) -> int:
             postdeploy = row.get("live_required") is True and row.get("live_when") == "postdeploy"
             predeploy_stage = args.stage in {"review", "deploy"}
             state = row.get("status")
-            pending_future = args.stage == "delivery" and state == "READY_FOR_LIVE" and future_observation(row)
+            pending_future = args.stage == "delivery" and not nondeployment and state == "READY_FOR_LIVE" and future_observation(row)
+            if nondeployment and row.get("live_required") is True:
+                errors.append(f"{rid}: non-deployment receipt cannot waive a live requirement")
             allowed = {"VERIFIED"}
             if predeploy_stage:
                 allowed.add("REVIEW")
@@ -434,7 +476,7 @@ def check(args) -> int:
             # A status or reviewer prose alone is insufficient. REVIEW requires
             # independent approval plus actual implementation evidence. New deploy
             # gate also checks approval for every mandatory row, including legacy VERIFIED.
-            if state == "REVIEW" or args.stage == "deploy" or pending_future or (predeploy_stage and state == "READY_FOR_LIVE" and future_observation(row)):
+            if receipt_mode or state == "REVIEW" or args.stage == "deploy" or pending_future or (predeploy_stage and state == "READY_FOR_LIVE" and future_observation(row)):
                 if not independent_approval(proofs, repo, rid, row.get("postrelease_wait") if state == "READY_FOR_LIVE" else None):
                     errors.append(f"{rid}: missing candidate-bound independent Reviewer approval")
                 if not any(isinstance(x.get("type"), str) and x["type"] in {"unit", "integration", "e2e", "live", "production", "ui", "provider", "test", "manual", "static", "inspection", "contract", "smoke"} for x in proofs):
@@ -450,19 +492,33 @@ def check(args) -> int:
                     errors.append(f"{rid}: live requirement lacks evidence for stage {args.stage}")
             if pending_future:
                 deferred.append(str(rid))
-        if args.stage in POSTDEPLOY_STAGES:
+        if args.stage in POSTDEPLOY_STAGES and not nondeployment:
             if strict:
                 verify_real_commit(repo, args.deployed_commit or "", errors, "deployed_commit (local existence only)")
             if not args.deployed_commit or args.deployed_commit != args.candidate:
                 errors.append("deployed commit missing or differs from reviewed candidate")
             if data.get("deployed_commit") != args.deployed_commit:
                 errors.append("map deployed_commit does not match actual deployment")
-        if args.stage == "delivery":
+        if args.stage == "delivery" and not nondeployment:
             # A delivery checkpoint needs actual deployment/smoke evidence even
             # if every remaining requirement depends on a future event.
             delivery = valid_proofs(bound_evidence({"evidence": data.get("delivery_evidence", [])}, args.candidate), repo, strict, "delivery")
             if not any(x.get("type") == "production" and x.get("deployed_commit") == args.deployed_commit for x in valid_proofs(delivery, repo, True, "delivery")):
                 errors.append("delivery: missing candidate/deployed-bound production health evidence")
+    if receipt_mode and not errors:
+        try:
+            base = Path(args.repo).resolve()
+            if any(not (base / ref).resolve().is_relative_to(base) or sha((base / ref).read_bytes()) != digest
+                   for ref, digest in receipt_inputs.items()):
+                errors.append("delivery receipt: inputs changed during gate")
+            if not errors:
+                receipt = {"map": p.resolve().relative_to(base).as_posix(),
+                           "candidate": args.candidate, "deployed": args.deployed_commit,
+                           "kind": "non_deployment" if nondeployment else "deployment",
+                           "deferred_req_ids": sorted(set(deferred)), "inputs": receipt_inputs}
+                print("delivery_receipt_v1=" + json.dumps(receipt, sort_keys=True, ensure_ascii=False))
+        except (OSError, ValueError) as exc:
+            errors.append(f"delivery receipt: {exc}")
     if args.stage == "delivery":
         print("engineering_delivery=" + ("PASS" if not errors else "FAIL"))
         print("acceptance=" + ("PENDING_FUTURE_EVIDENCE" if deferred else "RUN_RELEASE_GATE"))
@@ -618,6 +674,61 @@ def verify_artifact(repo: Path, entry: dict, rid: str, errors: list[str]) -> Non
 
 
 
+def verify_artifact_issues(repo, entry):
+    issues = []
+    verify_artifact(repo, entry, "delivery receipt", issues)
+    return issues
+
+
+def delivery_record(args):
+    """Resolve immutable Git evidence references, not semantic approval.
+
+    This is an optional convenience for recording an already reviewed and
+    delivered result. No working-tree hashes, plan re-audit or state writes.
+    Caller remains responsible for actual independent approval and delivery.
+    """
+    repo = Path(args.repo).resolve()
+    def git(*parts):
+        r = subprocess.run(["git", *parts], cwd=repo, capture_output=True, text=True, encoding="utf-8", errors="replace")
+        if r.returncode:
+            raise ValueError(f"Git reference not available: {parts[-1]}")
+        return r.stdout.strip()
+    def commit(ref):
+        if not isinstance(ref, str) or not ref.strip() or ref.startswith('-') or any(c in ref for c in '\r\n\x00'):
+            raise ValueError('invalid commit reference')
+        v = git('rev-parse', '--verify', '--end-of-options', ref + '^{commit}')
+        if not re.fullmatch(r'(?:[0-9a-f]{40}|[0-9a-f]{64})', v, re.I):
+            raise ValueError('not a resolved commit')
+        return v
+    def evidence(ref):
+        rev, sep, path = ref.partition(':')
+        if not sep or not path or path.startswith(('/', '\\')) or '\\' in path or any(c in path for c in '\r\n\x00') or any(x in ('.', '..', '') for x in path.split('/')):
+            raise ValueError('evidence must be an immutable Git ref:path')
+        bound = commit(rev) + ':' + path
+        if git('cat-file', '-t', bound) != 'blob' or int(git('cat-file', '-s', bound)) <= 0:
+            raise ValueError('evidence must be a nonempty committed blob')
+        # Reject symlink objects: a Git blob containing a link target is not the evidence.
+        mode = git('ls-tree', '-z', commit(rev), '--', path).split(' ', 1)[0]
+        if mode not in ('100644', '100755'):
+            raise ValueError('evidence must be a regular committed file')
+        return bound
+    try:
+        candidate = commit(args.candidate)
+        deployed = commit(args.deployed_commit) if args.deployed_commit else None
+        if args.kind == 'deployment' and deployed != candidate or args.kind == 'non_deployment' and deployed is not None:
+            raise ValueError('observed deployed commit must match the reviewed candidate; non-deployment must not supply one')
+        deferred = args.deferred_req_id or []
+        if not args.result.strip() or any(not x.strip() for x in deferred) or len(set(deferred)) != len(deferred):
+            raise ValueError('invalid result or deferred requirement IDs')
+        print(json.dumps({"kind": args.kind, "candidate": candidate, "deployed_commit": deployed,
+                          "review_ref": evidence(args.review_ref), "delivery_ref": evidence(args.delivery_ref),
+                          "result": args.result.strip(), "deferred_req_ids": deferred}, ensure_ascii=False, indent=2))
+        return 0
+    except (OSError, ValueError) as exc:
+        print(f"ERROR: {exc}", file=sys.stderr)
+        return 2
+
+
 def main() -> int:
     ap = argparse.ArgumentParser(description=__doc__)
     sub = ap.add_subparsers(dest="command", required=True)
@@ -632,12 +743,24 @@ def main() -> int:
     c.add_argument("--candidate")
     c.add_argument("--deployed-commit")
     c.add_argument("--graph", help="Optional JSON slice dependency/write-scope graph (see doc)")
+    c.add_argument("--non-deployment", action="store_true", help="Explicit non-deployment whole-map delivery receipt; strict evidence required")
     c.add_argument("--strict-evidence", action="store_true", help="Verify Git object and one real artifact per proven item; legacy maps require migration")
     c.add_argument("--repo", default=".", help="Repository root for strict Git/artifact checks (default: current directory)")
     d = sub.add_parser("contract-digest", help="Digest of one requirement at evidence creation")
     d.add_argument("--map", required=True)
     d.add_argument("--req-id", required=True)
+    r = sub.add_parser("delivery-record", help="Optional immutable reference resolution for an already reviewed/delivered result; no verdict")
+    r.add_argument("--repo", default=".")
+    r.add_argument("--kind", choices=("deployment", "non_deployment"), required=True)
+    r.add_argument("--candidate", required=True)
+    r.add_argument("--deployed-commit")
+    r.add_argument("--review-ref", required=True)
+    r.add_argument("--delivery-ref", required=True)
+    r.add_argument("--result", required=True)
+    r.add_argument("--deferred-req-id", action="append", default=[])
     a = ap.parse_args()
+    if a.command == "delivery-record":
+        return delivery_record(a)
     if a.command == "contract-digest":
         data = json.loads(Path(a.map).read_text(encoding="utf-8"))
         rows = [r for k in ("items", "additional_requirements") for r in data.get(k, [])

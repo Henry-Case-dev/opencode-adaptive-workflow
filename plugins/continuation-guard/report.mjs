@@ -4,10 +4,11 @@ import path from 'node:path';
 import crypto from 'node:crypto';
 import {execFile} from 'node:child_process';
 import {promisify} from 'node:util';
+import {closed,deliveryRecorded,taskIndex} from './core.mjs';
 const exec=promisify(execFile);
 const digest=s=>crypto.createHash('sha256').update(s).digest('hex');
 const unknown='[????????????????????] неизвестно';
-const statusNames={PENDING:'в очереди',PLANNED:'запланировано',READY:'готово к назначению',BUILDING:'в разработке',REVIEW:'проверка',READY_FOR_LIVE:'ожидает проверки на сервере',WAITING_EXTERNAL:'ожидает внешнего события',BLOCKED_REAL_HUMAN_GATE:'нужно решение владельца',FAILED:'ошибка',VERIFIED:'подтверждено',CANCELLED:'отменено'};
+const statusNames={PENDING:'в очереди',PLANNED:'запланировано',READY:'готово к назначению',BUILDING:'в разработке',REVIEW:'проверка',READY_FOR_LIVE:'ожидает проверки на сервере',WAITING_EXTERNAL:'ожидает внешнего события',BLOCKED_REAL_HUMAN_GATE:'нужно решение владельца',FAILED:'ошибка',VERIFIED:'исторически закрыто',DONE:'закрыто',COMPLETED:'исторически закрыто',READY_TO_SHIP:'готово к выпуску',IN_PROGRESS:'в разработке',NEEDS_FIXES:'нужны исправления',BLOCKED:'есть препятствие',WAITING_OWNER:'нужно решение владельца',DELIVERY:'выпуск',DEPLOYING:'выпуск',REVIEWING:'проверка',CANCELLED:'отменено'};
 const plain=(v)=>String(v??'').replace(/[\r\n\t]+/g,' ').trim();
 // Avoid transmitting raw files, secrets, logs or full session history to the reporting model.
 const safe=(v)=>plain(v).replace(/(?:Bearer\s+\S+|(?:api[_ -]?key|token|password|secret)\s*[:=]\s*\S+)/gi,'[скрыто]');
@@ -70,7 +71,7 @@ export function sourcePrefixes(scope,source){
       const id=e.target_task_ids[0];if(!mapped.has(id))mapped.set(id,new Set());for(const t of candidates)mapped.get(id).add(t);
     }
   }
-  for(const row of scope.tasks){
+  for(const row of taskIndex(scope).values()){
     const exact=byToken.get(row.id.toLowerCase());
     if(exact?.size===1){out.set(row.id,[...exact][0]);continue;}
     const aliases=mapped.get(row.id);
@@ -98,13 +99,13 @@ async function read(p){return fs.readFile(p,'utf8');}
 export async function readReportState(repo,{withStamps=true}={}){
   const [scopeRaw,workflow]=await Promise.all([read(path.join(repo,'plans','progress_scope.json')),read(path.join(repo,'plans','workflow_state.md'))]);
   const scope=JSON.parse(scopeRaw.replace(/^\uFEFF/,''));
-  if(scope?.schema!=='openworkflow-progress-scope-v1'||!Array.isArray(scope.tasks)||!scope.tasks.every(r=>r&&typeof r.id==='string'&&r.id.trim()&&typeof r.status==='string')||new Set(scope.tasks.map(r=>r.id)).size!==scope.tasks.length)throw Error('invalid report scope');
+  if(scope?.schema!=='openworkflow-progress-scope-v1'||!Array.isArray(scope.tasks))throw Error('invalid report scope');
   // Include referenced files in cache invalidation. Metadata is only a change
   // hint, not proof of completion; the progress tool checks actual content.
   const refs=new Set();
   for(const r of [...scope.tasks,...(Array.isArray(scope.owner_inputs)?scope.owner_inputs:[])]){
     if(!r||typeof r!=='object')continue;
-    for(const ref of [r.source_path,...(Array.isArray(r.maps)?r.maps:[]),r.delivery_gate_ref]){
+    for(const ref of (Array.isArray(r.maps)?r.maps:[])){
       if(typeof ref!=='string'||!ref)continue;
       const target=path.resolve(repo,ref),relative=path.relative(repo,target);
       if(relative&& !relative.startsWith('..'+path.sep)&&relative!=='..'&&!path.isAbsolute(relative))refs.add(target);
@@ -119,11 +120,19 @@ export async function readReportState(repo,{withStamps=true}={}){
   return {scope,workflow,sourcePrefixes:sourcePrefixes(scope,source),revision:digest(scopeRaw+'\0'+workflow+'\0'+JSON.stringify(stamps)+'\0'+digest(source))};
 }
 export function taskRows(scope){
-  return scope.tasks.filter(r=>!['VERIFIED','CANCELLED'].includes(statusOf(r))).sort((a,b)=>(Number.isSafeInteger(a.queue_position)&&a.queue_position>0?a.queue_position:Infinity)-(Number.isSafeInteger(b.queue_position)&&b.queue_position>0?b.queue_position:Infinity));
+  return [...taskIndex(scope).values()].filter(r=>!closed(r)&&!['CANCELLED','USER_EXCLUDED','N/A_WITH_REASON'].includes(statusOf(r))).sort((a,b)=>(Number.isSafeInteger(a.queue_position)&&a.queue_position>0?a.queue_position:Infinity)-(Number.isSafeInteger(b.queue_position)&&b.queue_position>0?b.queue_position:Infinity));
 }
 export function reportFacts(state,progress,previous=null){
-  const rows=taskRows(state.scope),done=state.scope.tasks.filter(r=>statusOf(r)==='VERIFIED');
-  const tasks=rows.map(r=>({id:r.id,sourcePrefix:state.sourcePrefixes?.get(r.id)??null,position:r.queue_position??null,priority:r.priority??null,status:r.status,execution_state:r.execution_state??null,blocked_by:Array.isArray(r.blocked_by)?r.blocked_by:[],title:safe(r.title??r.name??r.label),summary:excerpt(r.summary??r.description??r.source_note),titleRevision:digest(JSON.stringify([r.title??r.name??r.label??null,excerpt(r.summary??r.description??r.source_note,300)]))}));
+  const ok=progress?.measurable===true, req=ok&&progress?.requirements_measurable===true;
+  const partial=Array.isArray(progress?.stale_sources)&&progress.stale_sources.length?null:progress?.registered_scope_progress;
+  const delivery=ok?progress?.engineering_delivery:partial?.engineering_delivery;
+  const certified=new Set(delivery?.certified_task_ids??[]),deferred=new Set(delivery?.external_evidence_task_ids??[]),reconcile=new Set(delivery?.reconcile_task_ids??[]),optional=new Set(delivery?.optional_observation_task_ids??[]);
+  const lean=progress?.projection==='v4'||!progress;
+  const validRows=[...taskIndex(state.scope).values()];
+  const open=taskRows(state.scope),openIds=new Set(open.map(r=>r.id));
+  const rows=[...open,...validRows.filter(r=>!openIds.has(r.id)&&!['CANCELLED','USER_EXCLUDED','N/A_WITH_REASON'].includes(statusOf(r))&&(deferred.has(r.id)||reconcile.has(r.id)||optional.has(r.id)||(lean&&statusOf(r)==='DONE'&&deliveryRecorded(r)&&r.delivery.deferred_req_ids?.length)))];
+  const done=validRows.filter(r=>lean?closed(r):delivery?certified.has(r.id):closed(r));
+  const tasks=rows.map(r=>({id:r.id,closed:closed(r),externalEvidence:deferred.has(r.id)||(lean&&closed(r)&&statusOf(r)==='DONE'&&!!r.delivery?.deferred_req_ids?.length),deliveryReconcile:reconcile.has(r.id),optionalObservation:optional.has(r.id),sourcePrefix:state.sourcePrefixes?.get(r.id)??null,position:r.queue_position??null,priority:r.priority??null,status:statusOf(r)==='DONE'&&!closed(r)?'NEEDS_FIXES':r.status,execution_state:r.execution_state==='delivered_awaiting_evidence'&&!deferred.has(r.id)?'delivery_unconfirmed':r.execution_state??null,blocked_by:Array.isArray(r.blocked_by)?r.blocked_by:[],title:safe(r.title??r.name??r.label),summary:excerpt(r.summary??r.description??r.source_note),blocker:excerpt(r.blocker?.reason??r.blocker_reason??r.wait_reason??'',220),titleRevision:digest(JSON.stringify([r.title??r.name??r.label??null,excerpt(r.summary??r.description??r.source_note,300)]))}));
   // Current header only; no historical append-only section is treated as current state.
   const header=state.workflow.split(/\r?\n(?=##\s)/,1)[0];
   const fields={};
@@ -136,11 +145,12 @@ export function reportFacts(state,progress,previous=null){
   }
   const previousIds=new Set(previous??[]);
   const completedSince=previous===null?null:done.filter(r=>!previousIds.has(r.id)).map(r=>({id:r.id,title:excerpt(r.title??r.name??r.label??r.summary??r.description??r.source_note)}));
-  const ok=progress?.measurable===true, req=ok&&progress?.requirements_measurable===true;
-  const partial=Array.isArray(progress?.stale_sources)&&progress.stale_sources.length?null:progress?.registered_scope_progress;
   const observed=state.observed??[];
   const pending=(Array.isArray(state.scope.owner_inputs)?state.scope.owner_inputs:[]).filter(r=>r?.reconciled===false).map(r=>({id:safe(r.id),kind:safe(r.kind),targets:Array.isArray(r.target_task_ids)?r.target_task_ids.map(safe):[]}));
-  return {tasks,fields,observed,pending,completedCount:done.length,completedSince,progress:{tasks:statLine(ok?progress?.tasks:partial?.tasks,ok||!!partial),slices:statLine(req?progress?.slices:partial?.slices,req||!!partial),requirements:statLine(req?progress?.requirements:partial?.requirements,req||!!partial),partial:!!partial,reason:safe([progress?.reason,progress?.requirements_reason].filter(Boolean).join('; '))},queueCertified:progress?.queue_registration_complete===true};
+  const validIds=new Set(validRows.map(r=>r.id));
+  const conflictingIds=[...new Set(state.scope.tasks.filter(r=>r&&typeof r.id==='string'&&r.id.trim()&&!validIds.has(r.id)).map(r=>r.id))];
+  const malformedCount=state.scope.tasks.filter(r=>!r||typeof r.id!=='string'||!r.id.trim()).length;
+  return {tasks,fields,observed,pending,lean,conflictingIds,malformedCount,legacyClosed:delivery?.historical_count??null,newRecorded:delivery?.recorded_count??null,mapPartial:!!progress?.unmapped_tasks?.length||!!progress?.map_diagnostics?.length,deliveryKnown:!!delivery,deliveryCounts:delivery?{external:deferred.size,reconcile:reconcile.size,optional:optional.size}:null,completedCount:done.length,completedIds:done.map(r=>r.id),completedSince,progress:{delivery:statLine(delivery,!!delivery),tasks:statLine(ok?progress?.tasks:partial?.tasks,ok||!!partial),slices:statLine(req?progress?.slices:partial?.slices,req||!!partial),requirements:statLine(req?progress?.requirements:partial?.requirements,req||!!partial),partial:!!partial,reason:safe([progress?.reason,progress?.requirements_reason].filter(Boolean).join('; '))},queueCertified:progress?.queue_registration_complete===true};
 }
 const one=(facts,k)=>facts.fields[k]?.length===1?facts.fields[k][0]:undefined;
 // Only an explicit version at the start of a current production claim. Never
@@ -169,7 +179,7 @@ const ownerText=(facts,k)=>{
 };
 function fallback(facts,titles={}){
   const completed=facts.completedSince?.map(r=>humanText(r.title,110)||`Задача ${displayId(r.id)}`)??[];
-  const active=facts.tasks.filter(r=>['BUILDING','REVIEW','READY_FOR_LIVE'].includes(statusOf(r)));
+  const active=facts.tasks.filter(r=>!r.closed&&!r.externalEvidence&&['BUILDING','IN_PROGRESS','REVIEW','REVIEWING','READY_FOR_LIVE','READY_TO_SHIP','DELIVERY','DEPLOYING'].includes(statusOf(r)));
   const activeNames=active.slice(0,3).map(r=>taskLabel(r,titles));
   const activeMore=active.length>activeNames.length?` и ещё ${active.length-activeNames.length} (остальные в очереди)`:'';
   const blocked=facts.tasks.filter(r=>r.blocked_by.length||/WAITING|BLOCKED|FAILED/.test(statusOf(r)));
@@ -193,23 +203,45 @@ export function renderReport(facts,prose={},now=Date.now(),revision=''){
   const version=productionVersion(facts);
   const versionText=version?`По последней контрольной точке на сервере версия ${version}.`:'Текущая версия сервера не подтверждена.';
   const lines=[`**${clock(now)} — состояние проекта**`,'',`- Поручения: ${facts.progress.tasks}`,`- Этапы: ${facts.progress.slices}`,`- Требования: ${facts.progress.requirements}`];
+  if(facts.lean){lines[2]=`- Закрыто по зарегистрированной очереди: ${facts.progress.tasks}`;lines[3]=`- Этапы по имеющимся картам: ${facts.progress.slices}`;lines[4]=`- Требования по имеющимся картам: ${facts.progress.requirements}`;if(facts.deliveryKnown)lines.push('',`Записи доставки нового формата: ${facts.newRecorded??0}; исторически закрыто: ${facts.legacyClosed??0} (это не новая проверка сервера).`);if(facts.mapPartial)lines.push('Карты охватывают не все поручения; их показатели справочные.');}
+  else if(facts.deliveryKnown){lines.splice(2,0,`- Инженерно завершено (по сохранённым доказательствам): ${facts.progress.delivery}`);lines[3]=`- Поручения полностью подтверждены по реестру: ${facts.progress.tasks}`;}
   if(facts.progress.partial)lines.push('','Прогресс только по проверенному зарегистрированному объёму и учтённым картам; новые требования и/или порядок очереди ещё не подтверждены. Это не общий процент проекта.');
   if(facts.progress.reason)lines.push('',`Ограничение подсчёта: ${facts.progress.reason==='Состояние изменилось во время подсчёта; цифры не подтверждены.'?facts.progress.reason:'Есть неподтверждённые данные. См. очередь и новые поручения ниже.'}`);
   lines.push('', '**На сервере**','',versionText+' '+value('production'), '', '**Выполнено**','',value('completed'), '', '**Сейчас в работе**','',value('active'));
   if(fb.running)lines.push('',`Запущено агентов: ${fb.running}. Их завершение пока не подтверждено.`);
-  lines.push('', '**Дальше**','',value('next'), '', '**Что мешает**','',value('blockers'), '', '**Ваше участие**','',one(facts,'human gate')?.trim().toLowerCase()==='none'?fb.human:value('human'),'',`**Полная очередь (${facts.tasks.length}):**`,'');
-  if(facts.unavailable){lines[lines.length-2]='**Полная очередь:** не подтверждена — канонический реестр недоступен.';}else if(!facts.tasks.length)lines.push('Нет незакрытых записей в доступном реестре.');
+  const diagnoses=[['terminal-unreconciled','есть событие завершения хода или задания, но окончание работы и доставка результата ещё не согласованы'],['silence-unverified','долго не присылали наблюдаемых событий; зависание не доказано'],['permission-wait','ожидают разрешения'],['permission-unknown','состояние разрешений не подтверждено'],['observed','обнаружены, но состояние исполнения пока неизвестно']];
+  const notices=diagnoses.map(([state,description])=>({count:(facts.observed??[]).filter(a=>a.state===state).length,description})).filter(x=>x.count);
+  if(notices.length){lines.push('', '**Состояние исполнителей**','',...notices.map(x=>`- Агентов: ${x.count} — ${x.description}.`));}
+  for(const a of facts.observed??[]){
+    if(!['running','terminal-unreconciled','silence-unverified','permission-wait','permission-unknown'].includes(a.state))continue;
+    if(!a.role||!Number.isFinite(a.startedAt)||a.startedAt<=0||a.startedAt>now)continue;
+    const roles={builder:'Разработчик',reviewer:'Проверяющий',architect:'Архитектор',pm:'Планировщик',devops:'Специалист по выпуску',memory:'Агент памяти',arbiter:'Арбитр'};
+    const role=roles[String(a.role).toLowerCase()];if(!role)continue;
+    const mins=Math.floor((now-a.startedAt)/60000), duration=mins>=60?`${Math.floor(mins/60)} ч ${mins%60} мин`:`${mins} мин`;
+    lines.push('',`- ${role}: с начала наблюдения прошло ${duration}. ${a.state==='running'?'Завершение не зафиксировано.':diagnoses.find(x=>x[0]===a.state)?.[1]??'Состояние уточняется.'}`);
+  }
+  const engineering=facts.tasks.filter(r=>!r.externalEvidence&&!r.closed&&!['CANCELLED','USER_EXCLUDED','N/A_WITH_REASON'].includes(statusOf(r)));
+  const external=facts.tasks.filter(r=>r.externalEvidence),reconciliation=facts.tasks.filter(r=>r.deliveryReconcile&&(!facts.lean||r.closed)),optional=facts.tasks.filter(r=>r.optionalObservation);
+  lines.push('', '**Дальше**','',value('next'), '', '**Что мешает**','',value('blockers'), '', '**Ваше участие**','',one(facts,'human gate')?.trim().toLowerCase()==='none'?fb.human:value('human'),'',`**Полная очередь (${engineering.length+(facts.conflictingIds?.length??0)+(facts.malformedCount??0)}):**`,'');
+  if(facts.unavailable){lines[lines.length-2]='**Полная очередь:** не подтверждена — канонический реестр недоступен.';}else if(!engineering.length)lines.push('Нет открытых инженерных поручений в доступном реестре.');
   const byId=new Map(facts.tasks.map(row=>[row.id,row]));
-  for(const row of facts.tasks){
+  const rowLine=(row,detail)=>{
     const name=queueLabel(row,titles);
     const dep=row.blocked_by.length?` — зависит от: ${row.blocked_by.map(id=>{const other=byId.get(id);return other?taskLabel(other,titles):displayId(id)}).join(', ')}`:'';
-    const parked=row.execution_state==='delivered_awaiting_evidence'?' — работа доставлена, ожидается подтверждение':'';
     const priorityValue=Number.isSafeInteger(row.priority)&&row.priority>=0&&row.priority<=9?'P'+row.priority:typeof row.priority==='string'&&/^P[0-9]$/i.test(row.priority)?row.priority.toUpperCase():null;
     const priority=priorityValue?` — приоритет ${priorityValue}`:'';
-    lines.push(`- ${Number.isSafeInteger(row.position)&&row.position>0?'№'+row.position+'.':'Без позиции:'} ${name} — ${statusNames[String(row.status).toUpperCase()]??'статус не распознан'}${priority}${parked}${dep}`);
-  }
+    const uncertain=row.deliveryReconcile?' — нужно разрешить конкретное расхождение в записи':'';
+    const blocker=humanText(row.blocker,220);const waiting=/WAITING|BLOCKED/.test(statusOf(row));const why=waiting?(blocker?' — '+blocker:' — конкретная причина в реестре не указана'):'';
+    return `- ${Number.isSafeInteger(row.position)&&row.position>0?'№'+row.position+'.':'Без позиции:'} ${name} — ${detail??statusNames[String(row.status).toUpperCase()]??'статус не распознан'}${priority}${detail?'':uncertain+dep+why}`;
+  };
+  for(const row of engineering)lines.push(rowLine(row));
+  if(facts.conflictingIds?.length||facts.malformedCount){lines.push('','**Конфликтующие записи очереди (не считаются выполненными):**','',...facts.conflictingIds.map(id=>`- **${displayId(id)}** — повторный идентификатор; нужно уточнить эту задачу.`));if(facts.malformedCount)lines.push(`- Записей без идентификатора: ${facts.malformedCount}.`);}
+
+  if(external.length){lines.push('',`**Доставлено, ожидаются обязательные внешние доказательства (${external.length}):**`,'',...external.map(r=>rowLine(r,'инженерная работа завершена; проверка ещё не подтверждена')));}
+  if(reconciliation.length){lines.push('',`**Сверка ранее заявленной доставки (${reconciliation.length}):**`,'','Не считать новой разработкой без обнаруженного дефекта; прежние записи не доказывают текущую доставку.',...reconciliation.map(r=>rowLine(r,'нужно сверить сохранённые доказательства')));}
+  if(optional.length){lines.push('',`**Необязательное наблюдение после выпуска (${optional.length}):**`,'',...optional.map(r=>rowLine(r,'не задерживает завершение')));}
   if(facts.pending?.length){lines.push('', '**Новые поручения, ещё не учтённые в планах:**','');for(const p of facts.pending)lines.push(`- ${displayId(p.id)} — ${p.targets.map(id=>byId.has(id)?taskLabel(byId.get(id),titles):displayId(id)).join(', ')||'цели уточняются'}`);}
-  if(!facts.queueCertified)lines.push('','Порядок очереди не полностью подтверждён.');
+  if(!facts.queueCertified||facts.conflictingIds?.length||facts.malformedCount)lines.push('',facts.lean?'В реестре есть неполные записи; это не блокирует независимые задачи.':'Порядок очереди не полностью подтверждён.');
   lines.push('');
   if(prose.degraded)lines.push(prose.mixed?'Reporter: часть описаний ещё уточняется.':'Reporter: описание обновляется; показаны доступные факты.');else lines.push('Reporter: отдельная генерация модели.');
   lines.push('',`Ревизия отчёта: ${revision.slice(0,12)}`);
@@ -245,7 +277,7 @@ async function progressSnapshot(repo,pluginDir,signal){
   const candidates=process.env.OPENCODE_PYTHON?[[process.env.OPENCODE_PYTHON]]:process.platform==='win32'?[['py','-3'],['python'],['python3']]:[['python3'],['python']];
   for(const [bin,...args] of candidates){
     try{
-      const out=await exec(bin,[...args,script,'--scope-file',path.join(repo,'plans','progress_scope.json'),'--require-queue','--json'],{cwd:repo,signal,env:{...process.env,PYTHONUTF8:'1',PYTHONIOENCODING:'utf-8',PYTHONDONTWRITEBYTECODE:'1'},maxBuffer:32*1024*1024});
+      const out=await exec(bin,[...args,script,'--scope-file',path.join(repo,'plans','progress_scope.json'),'--json'],{cwd:repo,signal,env:{...process.env,PYTHONUTF8:'1',PYTHONIOENCODING:'utf-8',PYTHONDONTWRITEBYTECODE:'1'},maxBuffer:32*1024*1024});
       return JSON.parse(out.stdout);
     }catch(e){if(signal?.aborted)throw e;if(e.code===3&&e.stdout){try{return JSON.parse(e.stdout)}catch{}}if(e.code!=='ENOENT')break;}
   }
@@ -260,13 +292,13 @@ export function createReporter(ctx,{repo,pluginDir,now=Date.now,log=async()=>{},
   const valid=(root,epoch)=>root===getRoot()&&epoch===generation;
   const stateWithObserved=async(withStamps=true)=>{
     const state=await readReportState(repo,{withStamps});
-    state.observed=getObserved().map(x=>({id:x.id,state:x.state})).sort((a,b)=>a.id.localeCompare(b.id));
+    state.observed=getObserved().map(x=>({id:x.id,state:x.state,role:x.role??null,startedAt:x.startedAt??null})).sort((a,b)=>a.id.localeCompare(b.id));
     state.revision=digest(state.revision+'\0'+JSON.stringify(state.observed));return state;
   };
   const sectionInputs=facts=>{
     const f=facts.fields, pick=(...keys)=>Object.fromEntries(keys.map(k=>[k,(f[k]??[]).map(v=>excerpt(v,1600))]));
     const tasks=facts.tasks.map(({id,title,titleRevision,summary,status,execution_state,blocked_by,position,priority})=>({id,title:humanText(title,110)??'',titleRevision,summary:excerpt(summary,300),status,execution_state,blocked_by,position,priority}));
-    const relevant=tasks.filter(r=>['BUILDING','REVIEW','READY_FOR_LIVE'].includes(statusOf(r)));
+    const relevant=tasks.filter(r=>['BUILDING','IN_PROGRESS','REVIEW','REVIEWING','READY_FOR_LIVE','READY_TO_SHIP','DELIVERY','DEPLOYING'].includes(statusOf(r)));
     const blocked=tasks.filter(r=>r.blocked_by.length||/WAITING|BLOCKED|FAILED/.test(statusOf(r))).map(({id,title,status,execution_state,blocked_by})=>({id,title,status,execution_state,blocked_by}));
     return {
       production:pick('production','deployment','last completed'),
@@ -283,9 +315,9 @@ export function createReporter(ctx,{repo,pluginDir,now=Date.now,log=async()=>{},
   const markFailure=(map,id,key,boundary)=>{const old=map.get(id);map.set(id,{key,boundary,count:old?.key===key?old.count+1:1});};
   // Single background inference. No awaiting provider output at the report boundary.
   // No loops/timers; a subsequent natural model/child event retries changed facts.
-  function start(root,state,boundary){
+  function start(root,state,boundary,currentFacts=null){
     const epoch=generation;if(!valid(root,epoch)||inflight)return;
-    const facts=reportFacts(state,null,lastCompleted);const currentKeys=new Set(facts.tasks.map(titleKey));for(const k of titles.keys())if(!currentKeys.has(k))titles.delete(k);const delta=changes(facts,boundary);
+    const facts=currentFacts??reportFacts(state,null,lastCompleted);const currentKeys=new Set(facts.tasks.map(titleKey));for(const k of titles.keys())if(!currentKeys.has(k))titles.delete(k);const delta=changes(facts,boundary);
     for(const id of failedTitles.keys())if(!facts.tasks.some(r=>r.id===id))failedTitles.delete(id);
     if(!delta.fields.length&&!delta.rows.length)return;
     const controller=new AbortController(),started=now();
@@ -344,7 +376,7 @@ export function createReporter(ctx,{repo,pluginDir,now=Date.now,log=async()=>{},
         await log('report-snapshot-unavailable',{sessionId:root});
       }
       if(!stillCurrent())throw Error('report session changed');
-      if(!facts.unavailable)start(root,state,boundary);
+      if(!facts.unavailable)start(root,state,boundary,facts);
       const keys=sectionKeys(facts),known=readyTitles(facts),prose={titles:known};
       let translated=0;
       if(!facts.unavailable)for(const field of proseFields){const item=sections.get(field);if(item?.key===keys[field]){prose[field]=item.text;translated++;}}
@@ -352,10 +384,10 @@ export function createReporter(ctx,{repo,pluginDir,now=Date.now,log=async()=>{},
       prose.degraded=!ready;prose.mixed=translated>0||facts.tasks.some(r=>titles.has(titleKey(r)));
       // Distinct receipt for each actual boundary; same-boundary retries are
       // idempotent only when the material snapshot and narrative are unchanged.
-      const pk=JSON.stringify([root,boundary,state.revision,ready,prose,facts.progress,facts.queueCertified]);
+      const pk=JSON.stringify([root,boundary,state.revision,ready,prose,facts.progress,facts.queueCertified,facts.tasks.map(r=>[r.id,r.externalEvidence,r.deliveryReconcile,r.optionalObservation])]);
       if(cache&&preparedKey===pk&&!cache.published)return cache.text;
       const receipt=crypto.randomUUID().replaceAll('-','');
-      const prepared={root,boundary,revision:state.revision,text:renderReport(facts,prose,now(),state.revision)+`\n\nПубликация: ${receipt}`,completed:facts.unavailable?lastCompleted:state.scope.tasks.filter(r=>statusOf(r)==='VERIFIED').map(r=>r.id),published:false};cache=prepared;preparedKey=pk;
+      const prepared={root,boundary,revision:state.revision,text:renderReport(facts,prose,now(),state.revision)+`\n\nПубликация: ${receipt}`,completed:facts.unavailable?lastCompleted:facts.completedIds,published:false};cache=prepared;preparedKey=pk;
       await log('report-prepared',{sessionId:root,elapsedMs:now()-started,revision:state.revision.slice(0,12),source:ready?'model':prose.mixed?'mixed':'current-facts',boundary,receipt});
       if(!stillCurrent())throw Error('report session/boundary changed');
       return prepared.text;

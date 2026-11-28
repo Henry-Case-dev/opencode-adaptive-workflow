@@ -2,8 +2,8 @@
 """Atomic repair of the existing human-readable workflow checkpoint (no new state).
 
 Only repairs stale/duplicated Status and Next execution when an independently
-certified queued task exists and the current header has exactly one Human gate:
-none. Never changes owner inputs, task statuses or authorizes a dispatch.
+eligible queued task exists and the current header has exactly one Human gate:
+none or a valid task-local gate for unrelated work. Never changes owner inputs, task statuses or authorizes a dispatch.
 """
 from __future__ import annotations
 
@@ -16,62 +16,13 @@ import re
 import sys
 import tempfile
 
-TERMINAL = {"VERIFIED", "DONE", "COMPLETED", "CANCELLED", "USER_EXCLUDED", "N/A_WITH_REASON"}
-PASSIVE = {"WAITING_EXTERNAL", "BLOCKED_REAL_HUMAN_GATE", "BLOCKED", "WAITING_OWNER"}
-ACTIONABLE = {"PENDING", "PLANNED", "READY", "PREPARING", "BUILDING", "IN_PROGRESS",
-              "REVIEW", "REVIEWING", "DELIVERY", "DEPLOYING", "READY_FOR_LIVE", "FAILED",
-              "NEEDS_FIXES", "TO_DO", "TODO"}
-READY = {"PENDING", "PLANNED", "READY", "PREPARING", "TO_DO", "TODO"}
-SATISFIED = {"VERIFIED", "DONE", "COMPLETED"}
+from workflow_progress import ready_task_ids, task_index, task_status, PASSIVE_STATES
 KEY_RE = re.compile(r"^(Status|Human gate|Next execution):[ \t]*(.*)$", re.I)
 MACHINE_RE = re.compile(r"^([a-z][a-z0-9_-]*)(?:[ \t]*\([^()\r\n]*\))?$", re.I)
 
 
-def ready_tasks(scope: object) -> list[str]:
-    """Mirror the guard's conservative proof; this does not dispatch work."""
-    if not isinstance(scope, dict) or scope.get("schema") != "openworkflow-progress-scope-v1":
-        return []
-    tasks = scope.get("tasks")
-    if not isinstance(tasks, list) or not tasks:
-        return []
-    ids: dict[str, dict] = {}
-    positions = set()
-    for row in tasks:
-        if not isinstance(row, dict) or not isinstance(row.get("id"), str) or not row["id"].strip() or \
-           row["id"] in ids or not isinstance(row.get("status"), str):
-            return []
-        status = row["status"].strip().upper()
-        if status not in TERMINAL | PASSIVE | ACTIONABLE:
-            return []
-        ids[row["id"]] = row
-        if status in TERMINAL | PASSIVE:
-            continue
-        pos = row.get("queue_position")
-        if type(pos) is int and pos > 0:
-            if pos in positions:
-                return []
-            positions.add(pos)
-    result = []
-    for row in tasks:
-        if row["status"].strip().upper() not in READY:
-            continue
-        pos, priority, blockers = row.get("queue_position"), row.get("priority"), row.get("blocked_by")
-        if type(pos) is not int or pos <= 0:
-            continue
-        if not ((isinstance(priority, str) and re.fullmatch(r"P[0-9]", priority, re.I)) or
-                (type(priority) is int and 0 <= priority <= 9)):
-            continue
-        if not isinstance(blockers, list) or any(not isinstance(x, str) for x in blockers) or \
-                len(blockers) != len(set(blockers)):
-            continue
-        if any(str(ids.get(x, {}).get("status", "")).strip().upper() not in SATISFIED for x in blockers):
-            continue
-        if str(row.get("execution_state", "")).lower() in {
-            "delivered_awaiting_evidence", "waiting_external", "blocked", "running", "assigned"
-        }:
-            continue
-        result.append((pos, row["id"]))
-    return [tid for _pos, tid in sorted(result)]
+def ready_tasks(scope):
+    return ready_task_ids(scope)
 
 
 def split_header(text: str) -> tuple[str, str]:
@@ -104,7 +55,11 @@ def state(scope: object, text: str) -> dict:
     if len(human) != 1:
         return {"safe": False, "reason": "missing-or-duplicate-human-gate", "ready": ready}
     if machine_value(human[0]) != "none":
-        return {"safe": False, "reason": "human-gate", "ready": ready}
+        match = re.fullmatch(r'task\s*\(([^()\r\n]+)\)', human[0], re.I)
+        ids, _ = task_index(scope) if isinstance(scope, dict) and isinstance(scope.get('tasks'), list) else ({}, set())
+        gate = match[1].strip() if match else None
+        if not gate or task_status(ids.get(gate)) not in PASSIVE_STATES or not ready or gate in ready:
+            return {"safe": False, "reason": "human-gate", "ready": ready}
     statuses = values.get("status", [])
     executions = values.get("next execution", [])
     # Do not fabricate a missing checkpoint header from task inventory alone.

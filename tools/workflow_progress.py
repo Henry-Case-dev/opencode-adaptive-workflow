@@ -215,6 +215,142 @@ def audit_execution_queue(tasks: list[dict], project: Path | None = None,
             "parked_delivery_tasks": parked_delivery_tasks}
 
 
+def audit_delivery_receipts(tasks: list[dict], project: Path, reads: SnapshotReads,
+                            parked: list[str]) -> dict:
+    """Separate saved, whole-map engineering delivery from acceptance status.
+
+    This is a read-only provenance check, NOT a new release gate or a remote
+    health probe. Old status/receipt text alone never certifies delivery.
+    Reconcile a stale receipt with existing proof; do not blindly reopen work.
+    """
+    certified, deferred, reconcile, observation = [], [], [], []
+    root = project.resolve()
+    parked = set(parked)
+    resolved_paths = {}
+    def inside(raw):
+        if not isinstance(raw, str) or not raw.strip():
+            raise ValueError("missing path")
+        if raw not in resolved_paths:
+            p = _project_path(raw, root)
+            if not p.is_relative_to(root) or not p.is_file():
+                raise ValueError("missing/outside project")
+            resolved_paths[raw] = p
+        return resolved_paths[raw]
+    for task in tasks:
+        tid = task["id"]
+        status = task["status"].upper()
+        if status == "CANCELLED":
+            continue
+        marked = task.get("execution_state") == "delivered_awaiting_evidence"
+        if status != "VERIFIED" and not marked and not task.get("engineering_closed_at"):
+            continue
+        try:
+            if not task.get("coverage_complete") or not task.get("maps"):
+                raise ValueError("incomplete mapping")
+            if status != "VERIFIED" and tid not in parked:
+                raise ValueError("not a validated future-only handoff")
+            receipt = inside(task.get("delivery_gate_ref"))
+            receipt_lines = reads.text(receipt).splitlines()
+            rows = [json.loads(line.split("=", 1)[1]) for line in receipt_lines
+                    if line.startswith("delivery_receipt_v1=")]
+            if not rows or receipt_lines.count("engineering_delivery=PASS") != len(rows) or any(line.startswith("FAIL:") or line == "engineering_delivery=FAIL" for line in receipt_lines):
+                raise ValueError("missing successful full gate output")
+            expected = {inside(m) for m in task["maps"]}
+            seen, pending = set(), set()
+            for row in rows:
+                mp = inside(row["map"])
+                if mp not in expected or mp in seen:
+                    raise ValueError("wrong or duplicate map receipt")
+                seen.add(mp)
+                data = reads.json(mp)
+                candidate = row["candidate"]
+                if not isinstance(candidate, str) or not re.fullmatch(r"[0-9a-fA-F]{7,40}", candidate) or candidate != data.get("candidate_commit"):
+                    raise ValueError("candidate mismatch")
+                kind = row.get("kind")
+                if kind == "deployment":
+                    if row.get("deployed") != candidate or data.get("deployed_commit") != candidate:
+                        raise ValueError("deployment mismatch")
+                elif kind == "non_deployment":
+                    if data.get("delivery_kind") != kind or row.get("deployed") is not None or data.get("deployed_commit") or data.get("delivery_evidence"):
+                        raise ValueError("non-deployment mismatch")
+                else:
+                    raise ValueError("unknown delivery kind")
+                files = row["inputs"]
+                if not isinstance(files, dict) or not files:
+                    raise ValueError("missing input bindings")
+                bound = set()
+                for name, digest in files.items():
+                    f = inside(name)
+                    if not isinstance(digest, str) or reads.sha(f) != digest:
+                        raise ValueError("changed evidence or input")
+                    bound.add(f)
+                source = inside(data["source_path"])
+                if not {mp, source} <= bound or reads.sha(source) != data.get("source_sha256"):
+                    raise ValueError("missing map/source binding")
+                if data.get("slice_graph_path"):
+                    graph = inside(str(mp.parent / data["slice_graph_path"]))
+                    if graph not in bound:
+                        raise ValueError("missing graph binding")
+                outstanding = set()
+                mandatory = 0
+                def bound_artifact(ev):
+                    try:
+                        return inside(ev.get("artifact_path")) in bound
+                    except (OSError, ValueError, TypeError):
+                        return False
+                for req in data.get("items", []) + data.get("additional_requirements", []):
+                    if req.get("disposition") != "required":
+                        continue
+                    if optional_owner_check(req):
+                        if inside(req.get("owner_policy_ref")) not in bound or req.get("status") in {"FAILED", "BLOCKED_REAL_HUMAN_GATE"}:
+                            raise ValueError("invalid optional observation")
+                        continue
+                    mandatory += 1
+                    if kind == "non_deployment" and req.get("live_required") is True:
+                        raise ValueError("live requirement in non-deployment receipt")
+                    if req.get("status") != "VERIFIED":
+                        wait = req.get("postrelease_wait")
+                        if (req.get("status") != "READY_FOR_LIVE" or req.get("live_required") is not True or req.get("live_when") != "postdeploy" or not isinstance(wait, dict) or wait.get("nonblocking") is not True):
+                            raise ValueError("active or mandatory immediate defect cannot be deferred")
+                        outstanding.add(req["req_id"])
+                    # At least one real implementation and review artifact must
+                    # still exist in the exact hashed inputs. The gate checks
+                    # detailed proof and candidate applicability at issuance.
+                    evidence = req.get("evidence", [])
+                    def candidate_proof(ev):
+                        return (ev.get("candidate_commit") == candidate or
+                                (ev.get("reuse_on_metadata") is True and ev.get("type") in {"review", "unit", "integration", "e2e", "test", "static", "inspection", "contract"} and bool(ev.get("artifact_sha256")) and bool(ev.get("contract_sha256")))) and bound_artifact(ev)
+                    if not any(isinstance(ev, dict) and ev.get("type") == "review" and ev.get("reviewer_role") == "Reviewer" and ev.get("verdict") in {"Approved", "Approved for controlled deployment", "Approved for controlled deployment, parent not DONE"} and candidate_proof(ev) and (req.get("status") != "READY_FOR_LIVE" or ev.get("approved_postrelease_wait") == req.get("postrelease_wait")) for ev in evidence):
+                        raise ValueError("missing bound review")
+                    if not any(isinstance(ev, dict) and ev.get("type") in {"unit", "integration", "e2e", "live", "production", "ui", "provider", "test", "manual", "static", "inspection", "contract", "smoke"} and candidate_proof(ev) for ev in evidence):
+                        raise ValueError("missing bound implementation evidence")
+                if not mandatory:
+                    raise ValueError("no mandatory requirements")
+                if kind == "deployment" and not any(isinstance(ev, dict) and ev.get("type") == "production" and ev.get("candidate_commit") == candidate and ev.get("deployed_commit") == candidate and bound_artifact(ev) for ev in data.get("delivery_evidence", [])):
+                    raise ValueError("missing bound deployment proof")
+                if not isinstance(row.get("deferred_req_ids"), list) or set(row["deferred_req_ids"]) != outstanding:
+                    raise ValueError("deferred requirements differ")
+                pending.update(outstanding)
+            if seen != expected or (status == "VERIFIED" and pending) or (status != "VERIFIED" and (not pending or pending != set(task.get("deferred_req_ids", [])))):
+                raise ValueError("incomplete whole-task receipt")
+            certified.append(tid)
+            if pending:
+                deferred.append(tid)
+        except (OSError, ValueError, TypeError, KeyError, AttributeError):
+            reconcile.append(tid)
+        # Optional observations are never dispatchable or an engineering count.
+        try:
+            if any(optional_owner_check(req) and req.get("disposition") == "required" and req.get("status") != "VERIFIED"
+                   for m in task.get("maps", []) for data in [reads.json(inside(m))]
+                   for req in data.get("items", []) + data.get("additional_requirements", [])):
+                observation.append(tid)
+        except (OSError, ValueError, TypeError, AttributeError):
+            pass
+    return {"done": len(certified), "total": sum(t["status"].upper() != "CANCELLED" for t in tasks),
+            "certified_task_ids": certified, "external_evidence_task_ids": deferred,
+            "reconcile_task_ids": reconcile, "optional_observation_task_ids": observation}
+
+
 def optional_owner_check(row: dict) -> bool:
     return row.get("verification_tier", "engineering") == "owner_optional"
 
@@ -241,7 +377,7 @@ def _load_maps(paths: list[str], namespaces: dict[Path, str] | None = None, proj
             data = reads.json(p)
         except (UnicodeError, json.JSONDecodeError) as exc:
             raise ValueError(f"карта не читается: {p}: {exc}") from exc
-        if data.get("schema") != SCHEMA:
+        if not isinstance(data, dict) or data.get("schema") != SCHEMA:
             raise ValueError(f"неподдерживаемый формат карты: {p}")
         a = data.get("items", [])
         b = data.get("additional_requirements", [])
@@ -709,6 +845,14 @@ def _load_scope(scope_path: str, label: str, reads: SnapshotReads | None = None)
         if check["requirements"]["done"] == check["requirements"]["total"]:
             status_drift_candidates.append(task["id"])
     queue_audit = audit_execution_queue(tasks, project=project, reads=reads)
+    delivery = audit_delivery_receipts(tasks, project, reads, queue_audit["parked_delivery_tasks"])
+    changed_targets = {tid for iid in pending_inputs for tid in input_by_id[iid]["target_task_ids"]}
+    if changed_targets:
+        removed = changed_targets.intersection(delivery["certified_task_ids"])
+        for key in ("certified_task_ids", "external_evidence_task_ids"):
+            delivery[key] = [tid for tid in delivery[key] if tid not in removed]
+        delivery["reconcile_task_ids"] = list(dict.fromkeys(delivery["reconcile_task_ids"] + sorted(removed)))
+        delivery["done"] = len(delivery["certified_task_ids"])
     # Optional existing task-row annotations: read-only convergence signals.
     # Missing records do not block a legacy workflow or imply approval.
     try:
@@ -734,6 +878,11 @@ def _load_scope(scope_path: str, label: str, reads: SnapshotReads | None = None)
         "unmapped_tasks": uncovered, "stale_sources": stale,
         "source_coverage": section_coverage, "status_drift_candidates": status_drift_candidates,
         "execution_queue": queue_audit, "queue_registration_complete": queue_audit["complete"],
+        "engineering_delivery": delivery,
+        "engineering_queue": {"task_ids": [e["task_id"] for e in queue_audit["entries"]
+                                               if e["task_id"] not in delivery["external_evidence_task_ids"]],
+                              "external_evidence_task_ids": delivery["external_evidence_task_ids"],
+                              "delivery_reconciliation_task_ids": delivery["reconcile_task_ids"]},
         "convergence": convergence_audit,
         "measurable": not stale and not pending_inputs,
     }
@@ -759,11 +908,223 @@ def _load_scope(scope_path: str, label: str, reads: SnapshotReads | None = None)
     # Reporting-only counts for the already registered, validated scope. Never
     # relax measurable or requirements_measurable for acceptance/continuation.
     if (pending_inputs or uncovered) and not stale:
-        snap["registered_scope_progress"] = {"tasks": snap["tasks"]}
+        snap["registered_scope_progress"] = {"tasks": snap["tasks"], "engineering_delivery": delivery}
         # A valid mapped subset is visible even while a new task is unmapped.
         snap["registered_scope_progress"].update({k: map_summary[k] for k in ("slices", "requirements") if k in map_summary})
         if pending_inputs:
             snap["requirements_measurable"] = False
+    return snap
+
+
+# v4: execution state is a projection of the canonical task registry, never a
+# side effect of inspecting mutable historical evidence. The legacy deep audit
+# remains explicit (--legacy-audit) for investigating a concrete discrepancy.
+CLOSED_LEGACY = {'VERIFIED', 'COMPLETED'}
+EXCLUDED = {'CANCELLED', 'USER_EXCLUDED', 'N/A_WITH_REASON'}
+READY_STATES = {'PENDING', 'PLANNED', 'READY', 'PREPARING', 'READY_TO_SHIP', 'NEEDS_FIXES', 'TO_DO', 'TODO'}
+PASSIVE_STATES = {'WAITING_EXTERNAL', 'BLOCKED_REAL_HUMAN_GATE', 'BLOCKED', 'WAITING_OWNER'}
+ACTIVE_STATES = READY_STATES | {'BUILDING', 'IN_PROGRESS', 'REVIEW', 'REVIEWING', 'DELIVERY', 'DEPLOYING', 'READY_FOR_LIVE', 'FAILED'}
+
+
+def task_status(row):
+    return str(row.get('status') or '').strip().upper() if isinstance(row, dict) else ''
+
+
+def nonempty(value):
+    return isinstance(value, str) and bool(value.strip())
+
+
+def delivery_recorded(row):
+    d = row.get('delivery') if isinstance(row, dict) else None
+    if not isinstance(d, dict) or d.get('kind') not in ('deployment', 'non_deployment'):
+        return False
+    candidate = d.get('candidate')
+    if not isinstance(candidate, str) or not re.fullmatch(r'(?:[0-9a-f]{40}|[0-9a-f]{64})', candidate, re.I):
+        return False
+    for key in ('review_ref', 'delivery_ref'):
+        ref = d.get(key)
+        if not isinstance(ref, str) or not re.fullmatch(r'(?:[0-9a-f]{40}|[0-9a-f]{64}):[^\r\n]+', ref, re.I):
+            return False
+    if not nonempty(d.get('result')):
+        return False
+    if (d.get('deployed_commit') != candidate if d['kind'] == 'deployment' else d.get('deployed_commit') is not None):
+        return False
+    deferred = d.get('deferred_req_ids', [])
+    return isinstance(deferred, list) and all(nonempty(x) for x in deferred) and len(set(deferred)) == len(deferred)
+
+
+def task_closed(row):
+    return task_status(row) in CLOSED_LEGACY or (task_status(row) == 'DONE' and delivery_recorded(row))
+
+
+def task_index(scope):
+    ids, duplicates = {}, set()
+    for row in scope.get('tasks', []):
+        if not isinstance(row, dict) or not nonempty(row.get('id')):
+            continue
+        tid = row['id']
+        if tid in ids:
+            duplicates.add(tid)
+        else:
+            ids[tid] = row
+    for tid in duplicates:
+        del ids[tid]
+    return ids, duplicates
+
+
+def pending_inputs(scope):
+    inputs = scope.get('owner_inputs', [])
+    return [r for r in inputs if isinstance(r, dict) and r.get('reconciled') is False] if isinstance(inputs, list) else []
+
+
+def priority_of(value):
+    if isinstance(value, str) and re.fullmatch(r'P[0-9]', value, re.I):
+        return int(value[1])
+    return value if type(value) is int and 0 <= value <= 9 else None
+
+
+def position_of(value):
+    return value if type(value) is int and 0 < value <= 2**53-1 else 2**53-1
+
+
+def ready_task_ids(scope):
+    if not isinstance(scope, dict) or scope.get('schema') != SCOPE_SCHEMA or not isinstance(scope.get('tasks'), list):
+        return []
+    ids, _ = task_index(scope)
+    targets = {tid for entry in pending_inputs(scope) if isinstance(entry.get('target_task_ids'), list) for tid in entry['target_task_ids'] if isinstance(tid, str)}
+    result = []
+    for tid, row in ids.items():
+        pr = priority_of(row.get('priority'))
+        if task_status(row) not in READY_STATES or pr is None or tid in targets:
+            continue
+        blockers = row.get('blocked_by')
+        if not isinstance(blockers, list) or not all(nonempty(x) for x in blockers) or len(set(blockers)) != len(blockers):
+            continue
+        if any(b in targets or not task_closed(ids.get(b)) for b in blockers):
+            continue
+        if str(row.get('execution_state', '')).lower() in {'delivered_awaiting_evidence', 'waiting_external', 'blocked', 'running', 'assigned'}:
+            continue
+        result.append((pr, position_of(row.get('queue_position')), tid))
+    return [tid for _, _, tid in sorted(result)]
+
+
+def lean_scope_snapshot(scope_file, label, *, details=True):
+    """Fast read-only projection. Historical closure is not re-certified here.
+
+    Invalid records are reported, not silently deleted or converted to DONE.
+    Map diagnostics never become scheduling/delivery gates. Unmapped tasks are
+    legitimate and are counted in the primary task denominator immediately.
+    """
+    reads = SnapshotReads()
+    path = Path(scope_file).resolve()
+    root = reads.json(path)
+    if not isinstance(root, dict) or root.get('schema') != SCOPE_SCHEMA or not isinstance(root.get('tasks'), list):
+        raise ValueError('неподдерживаемый формат реестра задач')
+    project = path.parent.parent if path.parent.name == 'plans' else path.parent
+    ids, duplicates = task_index(root)
+    pending = pending_inputs(root)
+    historical, recorded, external, invalid, open_ids, observations, issues = [], [], [], [], [], [], []
+    issues.extend(f'повторный ID: {tid}' for tid in sorted(duplicates))
+    malformed = sum(not isinstance(r, dict) or not nonempty(r.get('id')) for r in root['tasks'])
+    if malformed:
+        issues.append(f'записей без ID: {malformed}')
+    if not isinstance(root.get('owner_inputs', []), list):
+        issues.append('некорректный список входящих поручений')
+    positions = {}
+    status_count = Counter()
+    # Count distinct IDs only; duplicate/malformed records remain an explicit
+    # completeness warning and never contribute to a positive completion claim.
+    total = len(duplicates) + malformed
+    for tid, row in ids.items():
+        status = task_status(row)
+        status_count[status] += 1
+        if status in EXCLUDED:
+            # Preserve old owner exclusions without silently certifying them.
+            continue
+        total += 1
+        if task_closed(row):
+            if status in CLOSED_LEGACY:
+                historical.append(tid)
+            else:
+                recorded.append(tid)
+                if row['delivery'].get('deferred_req_ids'):
+                    external.append(tid)
+            continue
+        open_ids.append(tid)
+        if status == 'DONE' or status not in ACTIVE_STATES | PASSIVE_STATES:
+            invalid.append(tid)
+            issues.append(f'{tid}: некорректное состояние или отсутствует запись доставки')
+        if status == 'WAITING_EXTERNAL' and row.get('execution_state') == 'delivered_awaiting_evidence':
+            # Old parking annotation is not a new delivery certificate; assess
+            # this specific handoff when it matters, not every historical task.
+            invalid.append(tid)
+        pos = row.get('queue_position')
+        if position_of(pos) != 2**53-1:
+            if pos in positions:
+                issues.append(f'{tid}: совпадает позиция с {positions[pos]} (не блокирует независимые задачи)')
+            positions[pos] = tid
+        if priority_of(row.get('priority')) is None:
+            issues.append(f'{tid}: приоритет не задан')
+        blockers = row.get('blocked_by')
+        if not isinstance(blockers, list) or not all(nonempty(x) for x in blockers):
+            issues.append(f'{tid}: не определены зависимости')
+    done = len(historical) + len(recorded)
+    delivery = {'done': done, 'total': total, 'certified_task_ids': recorded, 'legacy_closed_task_ids': historical,
+                'external_evidence_task_ids': external, 'reconcile_task_ids': list(dict.fromkeys(invalid)),
+                'optional_observation_task_ids': observations, 'recorded_count': len(recorded), 'historical_count': len(historical)}
+    snap = {'projection': 'v4', 'at_local': _clock(), 'scope': label, 'scope_file': str(path),
+            'tasks': {'done': done, 'total': total}, 'task_statuses': dict(status_count), 'engineering_delivery': delivery,
+            'engineering_queue': {'task_ids': open_ids, 'ready_task_ids': ready_task_ids(root), 'external_evidence_task_ids': external,
+                                  'delivery_reconciliation_task_ids': delivery['reconcile_task_ids']},
+            'execution_queue': {'complete': not issues, 'issues': issues}, 'queue_registration_complete': not issues,
+            'owner_inputs': {'pending': [r.get('id') for r in pending]}, 'stale_sources': [], 'measurable': bool(total),
+            'requirements_measurable': False, 'unmapped_tasks': [], 'map_diagnostics': []}
+    if issues or pending:
+        snap['reason'] = 'Есть неподтверждённые записи или новые поручения; показан зарегистрированный объём.'
+        snap['intake_pending'] = [r.get('id') for r in pending]
+    if details:
+        # Best-effort map statistics. Read each map once; no source hashes, old
+        # evidence, Git commands, convergence audit or per-task full gate.
+        paths, namespaces = [], {}
+        for tid, row in ids.items():
+            if task_status(row) in EXCLUDED:
+                continue
+            maps = row.get('maps', [])
+            if not isinstance(maps, list) or not maps:
+                snap['unmapped_tasks'].append(tid)
+                continue
+            for raw in maps:
+                if not nonempty(raw):
+                    snap['map_diagnostics'].append(tid + ': неверная ссылка на карту')
+                    continue
+                p = _project_path(raw, project)
+                if not p.is_relative_to(project) or p in namespaces and namespaces[p] != tid:
+                    snap['map_diagnostics'].append(tid + ': внешняя или общая карта')
+                    continue
+                namespaces[p] = tid
+                paths.append(str(p))
+        # Optional maps are a diagnostic subset, never a second task ledger.
+        try:
+            if paths:
+                snap.update(_load_maps(paths, namespaces=namespaces, project=project, reads=reads))
+                snap['requirements_measurable'] = True
+        except (OSError, ValueError, TypeError, KeyError, AttributeError) as exc:
+            snap['map_diagnostics'].append(str(exc))
+        if snap.get('owner_optional_checks', {}).get('pending'):
+            for tid, row in ids.items():
+                for raw in row.get('maps', []) if isinstance(row.get('maps'), list) else []:
+                    if not nonempty(raw):
+                        continue
+                    data = reads.objects.get(_project_path(raw, project))
+                    if isinstance(data, dict) and any(isinstance(x, dict) and optional_owner_check(x) and x.get('status') != 'VERIFIED' for x in data.get('items', []) + data.get('additional_requirements', [])):
+                        observations.append(tid)
+                        break
+    changed = reads.changed()
+    if changed:
+        snap['measurable'] = False
+        snap['requirements_measurable'] = False
+        snap['reason'] = 'Состояние изменилось во время подсчёта; цифры не подтверждены.'
+        snap['stale_sources'] = [changed]
     return snap
 
 
@@ -781,7 +1142,7 @@ def _stat(done: int, total: int, width: int = 20) -> str:
     return f"{done}/{total} ({pct}%) [{('#' * full) + ('-' * (width - full))}]"
 
 
-def snapshot(paths: list[str], label: str, scope_file: str | None = None,
+def legacy_snapshot(paths: list[str], label: str, scope_file: str | None = None,
              require_queue: bool = False) -> dict:
     if scope_file:
         reads = SnapshotReads()
@@ -794,7 +1155,7 @@ def snapshot(paths: list[str], label: str, scope_file: str | None = None,
             snap.setdefault("stale_sources", []).append(changed)
         if require_queue and not snap["queue_registration_complete"]:
             if snap["measurable"] and not snap.get("stale_sources"):
-                snap.setdefault("registered_scope_progress", {k: snap[k] for k in ("tasks", "slices", "requirements") if k in snap})
+                snap.setdefault("registered_scope_progress", {k: snap[k] for k in ("tasks", "slices", "requirements", "engineering_delivery") if k in snap})
             snap["measurable"] = False
             queue_reason = "очередь исполнения не завершена: отсутствует позиция, приоритет или проверяемая зависимость"
             snap["reason"] = snap.get("reason", "") + ("; " if snap.get("reason") else "") + queue_reason
@@ -813,7 +1174,27 @@ def snapshot(paths: list[str], label: str, scope_file: str | None = None,
     return snap
 
 
+def snapshot(paths, label, scope_file=None, require_queue=False, *, legacy_audit=False, details=True):
+    if scope_file and not legacy_audit:
+        return lean_scope_snapshot(scope_file, label, details=details)
+    return legacy_snapshot(paths, label, scope_file, require_queue)
+
+
 def present(snap: dict) -> str:
+    if snap.get('projection') == 'v4':
+        lines = [f"Время среды: {snap['at_local']}"]
+        if not snap['measurable']:
+            return "\n".join(lines + ['Прогресс неизвестен: ' + snap.get('reason', 'нет достоверного объёма')])
+        d = snap['engineering_delivery']
+        lines.append('Закрыто по реестру: ' + _stat(d['done'], d['total']))
+        lines.append(f"Записи доставки нового формата: {d['recorded_count']}; исторически закрыто: {d['historical_count']} (не новая проверка production).")
+        lines.append(f"В инженерной очереди: {len(snap['engineering_queue']['task_ids'])}; готово к назначению: {len(snap['engineering_queue']['ready_task_ids'])}.")
+        if snap.get('requirements_measurable'):
+            for key, name in [('slices', 'Этапы по имеющимся картам'), ('requirements', 'Требования по имеющимся картам')]:
+                lines.append(name + ': ' + _stat(snap[key]['done'], snap[key]['total']))
+        if snap.get('reason'):
+            lines.append(snap['reason'])
+        return "\n".join(lines)
     lines = [f"Время среды: {snap['at_local']}", f"Область: {snap['scope']}"]
     if snap.get("convergence", {}).get("needs_arbiter"):
         ids = [r["task_id"] for r in snap["convergence"]["needs_arbiter"]]
@@ -830,7 +1211,11 @@ def present(snap: dict) -> str:
         return "\n".join(lines)
     if "tasks" in snap:
         task = snap["tasks"]
-        lines.append("Поручения владельца подтверждены: " + _stat(task["done"], task["total"]))
+        lines.append("Поручения владельца полностью подтверждены по реестру: " + _stat(task["done"], task["total"]))
+        delivery = snap.get("engineering_delivery")
+        if delivery:
+            lines.append("Инженерно завершены по сохранённым доказательствам доставки: " + _stat(delivery["done"], delivery["total"]))
+            lines.append(f"Отдельно: обязательные внешние доказательства — {len(delivery['external_evidence_task_ids'])}; сверка доставки — {len(delivery['reconcile_task_ids'])}; необязательное наблюдение — {len(delivery['optional_observation_task_ids'])}.")
         if not snap.get("requirements_measurable"):
             lines.append("Общий процент по требованиям: не рассчитан — " + snap.get("requirements_reason", "данные неполные"))
             if snap.get("unmapped_tasks"):
@@ -860,6 +1245,8 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--map", action="append", default=[], help="Путь к карте требований (устаревший выбор только карт одной задачи)")
     parser.add_argument("--scope-file", help="Проверяемый реестр всех поручений plans/progress_scope.json; нужен для общего прогресса")
     parser.add_argument("--label", default="активное ТЗ", help="Человекочитаемое название области счёта")
+    parser.add_argument("--legacy-audit", action="store_true", help="Адресная диагностика старых карт и доказательств, не штатная приёмка")
+    parser.add_argument("--tasks-only", action="store_true", help="Только очередь, без карт требований")
     parser.add_argument("--json", action="store_true", help="Отдать структурированные данные")
     parser.add_argument("--inventory-template", action="store_true", help="Вывести шаблон обратного учёта current_task, не изменяя файлы")
     parser.add_argument("--require-queue", action="store_true", help="Не подтверждать общий прогресс при незавершённой регистрации в исполняемой очереди")
@@ -880,7 +1267,7 @@ def main(argv: list[str] | None = None) -> int:
             return 0
         if args.require_queue and not args.scope_file:
             raise ValueError("--require-queue требует --scope-file")
-        data = snapshot(args.map, args.label, args.scope_file, require_queue=args.require_queue)
+        data = snapshot(args.map, args.label, args.scope_file, require_queue=args.require_queue, legacy_audit=args.legacy_audit, details=not args.tasks_only)
         if args.compare_ref or args.compare_worktree:
             if not args.scope_file:
                 raise ValueError("сверка веток требует --scope-file")
@@ -904,7 +1291,7 @@ def main(argv: list[str] | None = None) -> int:
     print(json.dumps(data, ensure_ascii=False, indent=2) if args.json else present(data))
     # Queue admission is an explicit gate when requested, not just a warning in
     # a wall of JSON. Exit 3 preserves diagnostic output and mutates nothing.
-    return 3 if args.require_queue and not data.get("queue_registration_complete", False) else 0
+    return 3 if args.legacy_audit and args.require_queue and not data.get("queue_registration_complete", False) else 0
 
 
 if __name__ == "__main__":

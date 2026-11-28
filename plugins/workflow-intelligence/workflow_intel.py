@@ -198,23 +198,27 @@ def _hash_file(path: Path) -> str:
         return "MISSING"
 
 
-def dirty_fingerprint(repo: Path) -> str:
-    # Hash dirty *content*, not only `git status` names. Otherwise a file edited twice
-    # while remaining dirty would look unchanged and the cache could go stale.
+def dirty_fingerprint(repo: Path, paths: set[str] | None = None) -> str:
+    # Only indexed paths matter. Never read arbitrary untracked databases,
+    # archives or generated binary evidence just to navigate a code symbol.
     h = hashlib.sha1()
-    for rel in sorted(dirty_paths(repo)):
-        h.update(rel.encode("utf-8", "surrogatepass"))
+    if paths is None:
+        paths = {r for r in dirty_paths(repo) if is_relevant(r)}
+    limit = max_file_bytes()
+    for rel in sorted(paths):
+        h.update(rel.encode('utf-8', 'surrogatepass'))
         p = repo / rel
-        if p.exists() and p.is_file():
-            try:
-                st = p.stat()
-                h.update(str(st.st_size).encode())
-                h.update(str(st.st_mtime_ns).encode())
-            except OSError:
-                pass
-            h.update(_hash_file(p).encode())
-        else:
-            h.update(b"MISSING")
+        try:
+            if p.is_symlink() or not p.resolve().is_relative_to(repo.resolve()) or not p.is_file():
+                h.update(b'MISSING_OR_LINK')
+                continue
+            st = p.stat()
+            h.update(str(st.st_size).encode())
+            h.update(str(st.st_mtime_ns).encode())
+            if st.st_size <= limit:
+                h.update(_hash_file(p).encode())
+        except OSError:
+            h.update(b'MISSING')
     return h.hexdigest()
 
 
@@ -232,30 +236,32 @@ def full_file_list(repo: Path) -> set[str]:
     return {p for p in files if is_relevant(p)}
 
 
-def incremental_paths(repo: Path, db: sqlite3.Connection, force: bool = False) -> tuple[set[str], bool]:
-    head = current_head(repo)
-    dirty = dirty_fingerprint(repo)
-    last_head = meta_get(db, "last_head")
-    last_dirty = meta_get(db, "last_dirty")
-    if force or not last_head:
-        return full_file_list(repo), True
-    if head == last_head and dirty == last_dirty:
+def incremental_paths(repo: Path, db: sqlite3.Connection, force: bool = False, *, head=None, dirty=None, dirty_set=None) -> tuple[set[str], bool]:
+    head = current_head(repo) if head is None else head
+    dirty_set = {p for p in dirty_paths(repo) if is_relevant(p)} if dirty_set is None else dirty_set
+    dirty = dirty_fingerprint(repo, dirty_set) if dirty is None else dirty
+    last_head = meta_get(db, 'last_head')
+    last_dirty = meta_get(db, 'last_dirty')
+    old_paths = meta_get(db, 'last_dirty_paths')
+    if force or not last_head or not old_paths:
+        # Include indexed paths no longer present, including a previous
+        # untracked file removed since the last full refresh.
+        return full_file_list(repo) | {r[0] for r in db.execute('SELECT path FROM files')}, True
+    try:
+        old_dirty_set = set(json.loads(old_paths))
+    except (ValueError, TypeError):
+        return full_file_list(repo) | {r[0] for r in db.execute('SELECT path FROM files')}, True
+    if head == last_head and dirty == last_dirty and old_dirty_set == dirty_set:
         return set(), False
-
-    ancestor_ok = False
-    if last_head not in ("", "NO_HEAD") and head not in ("", "NO_HEAD"):
-        ancestor_ok = subprocess.run(
-            ["git", "merge-base", "--is-ancestor", last_head, head],
-            cwd=repo, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
-        ).returncode == 0
-    if head != last_head and not ancestor_ok:
-        return full_file_list(repo), True
-
-    changed: set[str] = set(dirty_paths(repo))
-    if head != last_head and last_head != "NO_HEAD" and head != "NO_HEAD":
-        changed.update(zsplit(run_git(repo, "diff", "--name-only", "-z", f"{last_head}..{head}", "--", check=False)))
-    # Keep deleted/renamed paths so cached rows are purged.
-    return {p for p in changed if is_relevant(p) or db.execute("SELECT 1 FROM files WHERE path=?", (p,)).fetchone()}, False
+    if head != last_head:
+        ancestor_ok = last_head not in ('', 'NO_HEAD') and head not in ('', 'NO_HEAD') and subprocess.run(
+            ['git','merge-base','--is-ancestor',last_head,head],cwd=repo,stdout=subprocess.DEVNULL,stderr=subprocess.DEVNULL).returncode == 0
+        if not ancestor_ok:
+            return full_file_list(repo) | {r[0] for r in db.execute('SELECT path FROM files')}, True
+    changed = set(dirty_set) | old_dirty_set  # include restored / deleted dirty files
+    if head != last_head:
+        changed.update(zsplit(run_git(repo,'diff','--name-only','-z',f'{last_head}..{head}','--',check=False)))
+    return {p for p in changed if is_relevant(p) or db.execute('SELECT 1 FROM files WHERE path=?',(p,)).fetchone()}, False
 
 
 def purge_path(db: sqlite3.Connection, rel: str) -> None:
@@ -502,14 +508,15 @@ def max_file_bytes() -> int:
 
 def refresh(repo: Path, db: sqlite3.Connection, force: bool = False) -> dict:
     started = time.perf_counter()
-    paths, full = incremental_paths(repo, db, force)
     head = current_head(repo)
-    dirty = dirty_fingerprint(repo)
+    dirty_set = {r for r in dirty_paths(repo) if is_relevant(r)}
+    dirty = dirty_fingerprint(repo, dirty_set)
+    paths, full = incremental_paths(repo, db, force, head=head, dirty=dirty, dirty_set=dirty_set)
     indexed = removed = errors = skipped_large = 0
     limit_bytes = max_file_bytes()
     for rel in sorted(paths):
         abs_path = repo / rel
-        if not abs_path.exists() or not abs_path.is_file():
+        if abs_path.is_symlink() or not abs_path.resolve().is_relative_to(repo.resolve()) or not abs_path.exists() or not abs_path.is_file():
             purge_path(db, rel)
             removed += 1
             continue
@@ -545,6 +552,7 @@ def refresh(repo: Path, db: sqlite3.Connection, force: bool = False) -> dict:
             errors += 1
     meta_set(db, "last_head", head)
     meta_set(db, "last_dirty", dirty)
+    meta_set(db, "last_dirty_paths", json.dumps(sorted(dirty_set)))
     db.commit()
     return {
         "mode": "full" if full else "incremental",
@@ -631,8 +639,12 @@ def test_audit(db: sqlite3.Connection) -> dict:
     unclassified = rows_as_dict(db.execute("SELECT path,name,line FROM tests WHERE lifecycle='UNCLASSIFIED' ORDER BY path,line LIMIT 80"), 80)
     provisional = rows_as_dict(db.execute("SELECT path,name,line,owner FROM tests WHERE lifecycle='PROVISIONAL' ORDER BY path,line LIMIT 80"), 80)
     skipped = rows_as_dict(db.execute("SELECT path,name,line,lifecycle,owner FROM tests WHERE skipped=1 ORDER BY path,line LIMIT 50"), 50)
-    policy = rows_as_dict(db.execute("SELECT path,name,line,lifecycle,owner FROM tests ORDER BY path,line"), 5000)
-    policy = [r for r in policy if POLICY_TEST_RE.search(r["name"]) or POLICY_TEST_RE.search(r["path"])][:60]
+    # Filter the complete inventory, not just the first 5000 alphabetically.
+    policy = []
+    for r in db.execute("SELECT path,name,line,lifecycle,owner FROM tests ORDER BY path,line"):
+        if POLICY_TEST_RE.search(r['name']) or POLICY_TEST_RE.search(r['path']):
+            policy.append(dict(r))
+            if len(policy) >= 60: break
     dup_groups = []
     for r in db.execute("SELECT body_hash,COUNT(*) c FROM tests WHERE body_hash<>'' GROUP BY body_hash HAVING c>1 ORDER BY c DESC LIMIT 20"):
         members = rows_as_dict(db.execute("SELECT path,name,line,lifecycle,owner FROM tests WHERE body_hash=? ORDER BY path,line LIMIT 10", (r[0],)), 10)
@@ -788,6 +800,8 @@ def main() -> int:
     ap.add_argument("--repo", default=os.getcwd())
     ns = ap.parse_args()
     repo = repo_root(Path(ns.repo))
+    if ns.action == 'scratch_status':
+        output(scratch_status(repo)); return 0
     db = connect(repo)
     refresh_info = refresh(repo, db, force=ns.full if ns.action == "refresh" else False)
     limit = max(1, min(ns.limit, 100))

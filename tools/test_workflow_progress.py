@@ -43,7 +43,7 @@ class WorkflowProgressTests(unittest.TestCase):
         src, fp = self.source("prompt.md", "готовая задача")
         scope = self.write_scope([{ "id":"T1", "status":"VERIFIED", "source_path":src,
                                    "source_sha256":fp, "maps":[m], "coverage_complete":True }])
-        snap = progress.snapshot([], "весь проект", scope)
+        snap = progress.legacy_snapshot([], "весь проект", scope)
         self.assertFalse(snap["measurable"])
         self.assertIn("неподтверждённые", snap["stale_sources"][0])
 
@@ -57,7 +57,7 @@ class WorkflowProgressTests(unittest.TestCase):
             {"id": "new", "status": "PENDING", "source_path": src2, "source_sha256": hash2,
              "maps": [], "coverage_complete": False},
         ]
-        snap = progress.snapshot([], "весь проект", self.write_scope(tasks))
+        snap = progress.legacy_snapshot([], "весь проект", self.write_scope(tasks))
         self.assertEqual(snap["tasks"], {"done": 1, "total": 2})
         self.assertFalse(snap["requirements_measurable"])
         output = progress.present(snap)
@@ -74,7 +74,7 @@ class WorkflowProgressTests(unittest.TestCase):
             {"id": "A", "status": "VERIFIED", "source_path": x, "source_sha256": fx, "maps": [a], "coverage_complete": True},
             {"id": "B", "status": "PENDING", "source_path": y, "source_sha256": fy, "maps": [b], "coverage_complete": True},
         ])
-        snap = progress.snapshot([], "проект", scope)
+        snap = progress.legacy_snapshot([], "проект", scope)
         self.assertEqual(snap["slices"], {"done": 1, "total": 2})
 
     def test_after_mapping_new_requirements_denominator_increases(self):
@@ -88,7 +88,7 @@ class WorkflowProgressTests(unittest.TestCase):
             {"id": "new", "status": "PENDING", "source_path": src2, "source_sha256": hash2,
              "maps": [b], "coverage_complete": True},
         ]
-        snap = progress.snapshot([], "весь проект", self.write_scope(tasks))
+        snap = progress.legacy_snapshot([], "весь проект", self.write_scope(tasks))
         self.assertTrue(snap["requirements_measurable"])
         self.assertEqual(snap["requirements"], {"done": 1, "total": 3})
         self.assertIn("1/3 (33%)", progress.present(snap))
@@ -100,7 +100,7 @@ class WorkflowProgressTests(unittest.TestCase):
         scope = self.write_scope([{"id": "T1", "status": "VERIFIED", "source_path": src,
                                   "source_sha256": fingerprint, "maps": [a], "coverage_complete": True}])
         Path(src).write_text("старая задача\nновое требование", encoding="utf-8")
-        snap = progress.snapshot([], "весь проект", scope)
+        snap = progress.legacy_snapshot([], "весь проект", scope)
         self.assertFalse(snap["measurable"])
         self.assertIn("исходное задание изменилось", progress.present(snap))
         self.assertNotIn("100%", progress.present(snap))
@@ -109,7 +109,7 @@ class WorkflowProgressTests(unittest.TestCase):
         src, _ = self.source("prompt.md", "задача")
         scope = self.write_scope([{"id": "T1", "status": "PENDING", "source_path": src,
                                   "maps": [], "coverage_complete": False}])
-        self.assertFalse(progress.snapshot([], "задача", scope)["measurable"])
+        self.assertFalse(progress.legacy_snapshot([], "задача", scope)["measurable"])
 
     def test_scope_cli_json(self):
         src, fingerprint = self.source("prompt.md", "проверить")
@@ -123,7 +123,7 @@ class WorkflowProgressTests(unittest.TestCase):
     def test_unique_requirements_and_slice_all_verified(self):
         m = self.write_map("main.json", [("R1", "W1", "VERIFIED"), ("R2", "W1", "READY_FOR_LIVE"),
                                           ("R3", "W2", "VERIFIED"), ("R4", "W3", "FAILED")])
-        snap = progress.snapshot([m], "эпик")
+        snap = progress.legacy_snapshot([m], "эпик")
         self.assertEqual(snap["requirements"], {"done": 2, "total": 4})
         self.assertEqual(snap["slices"], {"done": 1, "total": 3})
         self.assertIn("1/3 (33%)", progress.present(snap))
@@ -132,45 +132,45 @@ class WorkflowProgressTests(unittest.TestCase):
     def test_two_maps_count_same_slice_once(self):
         a = self.write_map("main.json", [("M1", "W1", "VERIFIED"), ("M2", "W2", "VERIFIED")])
         b = self.write_map("amend.json", [("A1", "W1", "PENDING"), ("A2", "W3", "VERIFIED")])
-        snap = progress.snapshot([a, b, a], "task")
+        snap = progress.legacy_snapshot([a, b, a], "task")
         self.assertEqual(snap["requirements"], {"done": 3, "total": 4})
         self.assertEqual(snap["slices"], {"done": 2, "total": 3})
         self.assertEqual(len(snap["maps"]), 2)
 
     def test_duplicate_req_id_not_doubled(self):
         a = self.write_map("main.json", [("M1", "W1", "VERIFIED"), ("M1", "W1", "VERIFIED")])
-        snap = progress.snapshot([a], "task")
+        snap = progress.legacy_snapshot([a], "task")
         self.assertEqual(snap["requirements"]["total"], 1)
         self.assertEqual(snap["duplicates_collapsed"], 1)
 
     def test_contradictory_duplicate_is_error(self):
         a = self.write_map("main.json", [("M1", "W1", "VERIFIED"), ("M1", "W1", "PENDING")])
         with self.assertRaisesRegex(ValueError, "два статуса"):
-            progress.snapshot([a], "task")
+            progress.legacy_snapshot([a], "task")
 
     def test_missing_map_returns_error_not_fake_zero(self):
         with contextlib.redirect_stderr(io.StringIO()):
             self.assertEqual(progress.main(["--map", str(self.root / "missing.json")]), 2)
 
     def test_no_map_discloses_unknown_scope(self):
-        snap = progress.snapshot([], "эпик")
+        snap = progress.legacy_snapshot([], "эпик")
         self.assertFalse(snap["measurable"])
         self.assertIn("не рассчитан", progress.present(snap))
         self.assertNotIn("0/0", progress.present(snap))
 
     def test_excluded_context_not_in_denominator(self):
         a = self.write_map("main.json", [("M1", "W1", "VERIFIED")])
-        self.assertEqual(progress.snapshot([a], "epic")["requirements"]["total"], 1)
+        self.assertEqual(progress.legacy_snapshot([a], "epic")["requirements"]["total"], 1)
 
     def test_empty_required_is_unknown_not_100(self):
         a = self.write_map("main.json", [])
         with self.assertRaisesRegex(ValueError, "нет обязательных"):
-            progress.snapshot([a], "epic")
+            progress.legacy_snapshot([a], "epic")
 
     def test_unknown_status_rejected(self):
         a = self.write_map("main.json", [("M1", "W1", "PLANNED")])
         with self.assertRaisesRegex(ValueError, "неизвестный статус"):
-            progress.snapshot([a], "epic")
+            progress.legacy_snapshot([a], "epic")
 
     def test_owner_optional_is_separate_from_engineering_progress(self):
         policy = self.root / "owner_live_checks.md"
@@ -183,7 +183,7 @@ class WorkflowProgressTests(unittest.TestCase):
              "owner_policy_ref": str(policy), "owner_optional_reason":"Voluntary owner subjective client feedback",
              "engineering_req_ids":["R1"]}]}
         p.write_text(json.dumps(data), encoding="utf8")
-        snap = progress.snapshot([str(p)], "проект")
+        snap = progress.legacy_snapshot([str(p)], "проект")
         self.assertEqual(snap["requirements"], {"done":1,"total":1})
         self.assertEqual(snap["slices"], {"done":1,"total":1})
         self.assertEqual(snap["owner_optional_checks"], {"total":1,"pending":1,"verified":0})
@@ -192,7 +192,7 @@ class WorkflowProgressTests(unittest.TestCase):
         src, fp = self.source("task.md", "Task")
         scope = self.write_scope([{"id":"T1", "status":"VERIFIED", "source_path":src,
                                    "source_sha256":fp, "maps":[str(p)], "coverage_complete":True}])
-        self.assertTrue(progress.snapshot([], "проект", scope)["measurable"])
+        self.assertTrue(progress.legacy_snapshot([], "проект", scope)["measurable"])
 
     def test_owner_optional_cannot_hide_failure_or_absent_peer(self):
         p = self.root / "policy.md"
@@ -205,16 +205,16 @@ class WorkflowProgressTests(unittest.TestCase):
             {"disposition":"required", "req_id":"R1", "slice":"S1", "status":"VERIFIED"}]}
         m.write_text(json.dumps(data), encoding="utf8")
         with self.assertRaisesRegex(ValueError, "без инженерной пары"):
-            progress.snapshot([str(m)], "p")
+            progress.legacy_snapshot([str(m)], "p")
         data["items"][0]["engineering_req_ids"] = ["R1"]
         data["items"][0]["status"] = "FAILED"
         m.write_text(json.dumps(data), encoding="utf8")
         with self.assertRaisesRegex(ValueError, "проблема в необязательной проверке"):
-            progress.snapshot([str(m)], "p")
+            progress.legacy_snapshot([str(m)], "p")
 
     def test_full_verified_is_100_percent(self):
         a = self.write_map("main.json", [("M1", "W1", "VERIFIED"), ("M2", "W2", "VERIFIED")])
-        lines = progress.present(progress.snapshot([a], "task"))
+        lines = progress.present(progress.legacy_snapshot([a], "task"))
         self.assertIn("2/2 (100%) [####################]", lines)
 
     def test_json_cli(self):
@@ -239,7 +239,7 @@ class WorkflowProgressTests(unittest.TestCase):
                   "maps":[m], "coverage_complete":True}]
         inp = [{"id":"in2", "kind":"correction", "source_path":change,
                 "source_sha256":hc, "target_task_ids":["T"], "reconciled":False}]
-        snap = progress.snapshot([], "project", self.scope_with_inputs(tasks, inp))
+        snap = progress.legacy_snapshot([], "project", self.scope_with_inputs(tasks, inp))
         self.assertFalse(snap["measurable"])
         self.assertEqual(snap["tasks"], {"done":1,"total":1})
         self.assertIn("in2", progress.present(snap))
@@ -249,7 +249,7 @@ class WorkflowProgressTests(unittest.TestCase):
         self.assertEqual(snap["registered_scope_progress"]["slices"], {"done":1,"total":1})
         # Source drift invalidates even the partial display.
         Path(initial).write_text("changed", encoding="utf-8")
-        drift = progress.snapshot([], "project", self.scope_with_inputs(tasks, inp))
+        drift = progress.legacy_snapshot([], "project", self.scope_with_inputs(tasks, inp))
         self.assertFalse(drift["measurable"])
         self.assertNotIn("registered_scope_progress", drift)
 
@@ -262,7 +262,7 @@ class WorkflowProgressTests(unittest.TestCase):
         inp = [{"id":"in2", "kind":"amendment", "source_path":amend,
                 "source_sha256":ha, "target_task_ids":["T"], "reconciled":True,
                 "coverage_refs":[{"task_id":"T", "map":m, "req_ids":["R2"]}]}]
-        snap = progress.snapshot([], "project", self.scope_with_inputs(tasks, inp))
+        snap = progress.legacy_snapshot([], "project", self.scope_with_inputs(tasks, inp))
         self.assertTrue(snap["measurable"])
         self.assertEqual(snap["tasks"]["total"], 1)
         self.assertEqual(snap["requirements"]["total"], 2)
@@ -275,10 +275,10 @@ class WorkflowProgressTests(unittest.TestCase):
                   "maps":[m], "coverage_complete":True}]
         inp = [{"id":"incoming", "kind":"new_task", "source_path":new,
                 "source_sha256":hn, "target_task_ids":[], "reconciled":False}]
-        snap = progress.snapshot([], "project", self.scope_with_inputs(tasks, inp))
+        snap = progress.legacy_snapshot([], "project", self.scope_with_inputs(tasks, inp))
         self.assertFalse(snap["measurable"])
         inp[0]["reconciled"] = True
-        snap = progress.snapshot([], "project", self.scope_with_inputs(tasks, inp))
+        snap = progress.legacy_snapshot([], "project", self.scope_with_inputs(tasks, inp))
         self.assertFalse(snap["measurable"])
         self.assertIn("не связано с задачей", snap["stale_sources"][0])
 
@@ -288,11 +288,11 @@ class WorkflowProgressTests(unittest.TestCase):
                 "source_sha256":h, "maps":[], "coverage_complete":False}
         inp = {"id":"x", "kind":"correction", "source_path":str(self.root / "gone.md"),
                "source_sha256":h,"target_task_ids":["T"], "reconciled":False}
-        snap = progress.snapshot([], "project", self.scope_with_inputs([task],[inp]))
+        snap = progress.legacy_snapshot([], "project", self.scope_with_inputs([task],[inp]))
         self.assertFalse(snap["measurable"])
         self.assertIn("потерян", snap["stale_sources"][0])
         with self.assertRaisesRegex(ValueError, "повторный ID входящего"):
-            progress.snapshot([], "project", self.scope_with_inputs([task],[inp,inp]))
+            progress.legacy_snapshot([], "project", self.scope_with_inputs([task],[inp,inp]))
 
     def test_cancelled_task_excluded_from_active_denominator_only_with_owner_source(self):
         original,h = self.source("task.md", "initial")
@@ -305,11 +305,11 @@ class WorkflowProgressTests(unittest.TestCase):
              "cancelled_by_input":"cancel1"}
         inp = {"id":"cancel1", "kind":"cancellation", "source_path":cancel,
                "source_sha256":hc,"target_task_ids":["B"],"reconciled":True}
-        snap = progress.snapshot([], "project", self.scope_with_inputs([a,b],[inp]))
+        snap = progress.legacy_snapshot([], "project", self.scope_with_inputs([a,b],[inp]))
         self.assertTrue(snap["measurable"])
         self.assertEqual(snap["tasks"], {"done":1,"total":1})
         b.pop("cancelled_by_input")
-        snap = progress.snapshot([], "project", self.scope_with_inputs([a,b],[inp]))
+        snap = progress.legacy_snapshot([], "project", self.scope_with_inputs([a,b],[inp]))
         self.assertFalse(snap["measurable"])
 
     def test_saved_input_without_index_entry_is_detected(self):
@@ -320,7 +320,7 @@ class WorkflowProgressTests(unittest.TestCase):
         (inbox / "orphan.md").write_text("important correction", encoding="utf-8")
         scope = self.write_scope([{"id":"T", "status":"PENDING", "source_path":src,
                                   "source_sha256":h, "maps":[], "coverage_complete":False}])
-        snap = progress.snapshot([], "project", scope)
+        snap = progress.legacy_snapshot([], "project", scope)
         self.assertFalse(snap["measurable"])
         self.assertIn("неучтённое входящее", snap["stale_sources"][0])
 
@@ -329,7 +329,7 @@ class WorkflowProgressTests(unittest.TestCase):
         src,h = self.source("a.md","hello")
         scope = self.write_scope([{"id":"T","status":"VERIFIED","source_path":src,
                                   "source_sha256":h,"maps":[m],"coverage_complete":True}])
-        snap = progress.snapshot([],"project",scope)
+        snap = progress.legacy_snapshot([],"project",scope)
         self.assertTrue(snap["measurable"])
         self.assertEqual(snap["owner_inputs"]["registered"],0)
 
@@ -346,7 +346,7 @@ class WorkflowProgressTests(unittest.TestCase):
             "id": "T", "status": "VERIFIED", "source_path":src,"source_sha256":sha,
             "maps": [m], "coverage_complete": True
         }]}), encoding="utf-8")
-        snap = progress.snapshot([], "global", str(scope))
+        snap = progress.legacy_snapshot([], "global", str(scope))
         self.assertFalse(snap["measurable"])
         self.assertIn("source_inventory", " ".join(snap["stale_sources"]))
         template = progress.inventory_template(folder / "current_task.md", self.root)
@@ -367,7 +367,7 @@ class WorkflowProgressTests(unittest.TestCase):
         manifest["sections"][0].update(disposition="mapped", target_task_ids=["T"], coverage_refs=[m])
         scope = folder / "progress_scope.json"
         scope.write_text(json.dumps({"schema":progress.SCOPE_SCHEMA, "tasks":[t],"source_inventory":manifest}),encoding="utf8")
-        snap = progress.snapshot([], "global", str(scope))
+        snap = progress.legacy_snapshot([], "global", str(scope))
         self.assertFalse(snap["measurable"])
         self.assertIn("не учтён раздел current_task", " ".join(snap["stale_sources"]))
 
@@ -390,7 +390,7 @@ class WorkflowProgressTests(unittest.TestCase):
         scope = folder / "progress_scope.json"
         scope.write_text(json.dumps({"schema":progress.SCOPE_SCHEMA,"tasks":tasks,
                                      "owner_inputs":[inp],"source_inventory":manifest}), encoding="utf8")
-        snap = progress.snapshot([], "global", str(scope))
+        snap = progress.legacy_snapshot([], "global", str(scope))
         self.assertTrue(snap["measurable"], snap["stale_sources"])
         self.assertEqual(snap["source_coverage"]["accounted"], 2)
         self.assertEqual(snap["requirements"]["total"], 2)
@@ -398,7 +398,7 @@ class WorkflowProgressTests(unittest.TestCase):
 
         # A newly appended owner section must reopen scope coverage.
         src_file.write_text(src_file.read_text(encoding="utf8")+"# Epic C\nDo c\n",encoding="utf8")
-        drift = progress.snapshot([], "global", str(scope))
+        drift = progress.legacy_snapshot([], "global", str(scope))
         self.assertFalse(drift["measurable"])
         self.assertTrue(any("Epic C" in item for item in drift["stale_sources"]))
 
@@ -411,7 +411,7 @@ class WorkflowProgressTests(unittest.TestCase):
         inp={"id":"delta","kind":"correction","source_path":change,"source_sha256":hc,
              "target_task_ids":["T"],"reconciled":True,
              "coverage_refs":[{"task_id":"T","map":m,"req_ids":["NONEXISTENT"]}]}
-        snap=progress.snapshot([],"global",self.scope_with_inputs(tasks,[inp]))
+        snap=progress.legacy_snapshot([],"global",self.scope_with_inputs(tasks,[inp]))
         self.assertFalse(snap["measurable"])
         self.assertIn("NONEXISTENT"," ".join(snap["stale_sources"]))
 
@@ -423,7 +423,7 @@ class WorkflowProgressTests(unittest.TestCase):
                 "maps":[m],"coverage_complete":True}]
         inp={"id":"delta","kind":"correction","source_path":change,"source_sha256":hc,
              "target_task_ids":["T"],"reconciled":True}
-        snap=progress.snapshot([],"global",self.scope_with_inputs(tasks,[inp]))
+        snap=progress.legacy_snapshot([],"global",self.scope_with_inputs(tasks,[inp]))
         self.assertFalse(snap["measurable"])
         self.assertIn("reconciled=true", " ".join(snap["stale_sources"]))
 
@@ -484,7 +484,7 @@ class CheckoutLocationIntegrityTests(unittest.TestCase):
         initial = Path.cwd()
         try:
             os.chdir(self.root / 'other')
-            snap = progress.snapshot([], 'all', str(self.scope))
+            snap = progress.legacy_snapshot([], 'all', str(self.scope))
             self.assertTrue(snap['measurable'], snap['stale_sources'])
             self.assertTrue(snap['requirements_measurable'])
             self.assertEqual(snap['requirements']['total'], 1)
@@ -505,7 +505,7 @@ class TestDurableQueueRegistration(unittest.TestCase):
                            "source_path": str(source),
                            "source_sha256": hashlib.sha256(source.read_bytes()).hexdigest(),
                            "maps": [], "coverage_complete": False}]}), encoding="utf8")
-            snap = progress.snapshot([], "project", str(scope), require_queue=True)
+            snap = progress.legacy_snapshot([], "project", str(scope), require_queue=True)
             self.assertFalse(snap["queue_registration_complete"])
             self.assertFalse(snap["measurable"])
             self.assertTrue(any("queue_position" in x for x in snap["execution_queue"]["issues"]))
@@ -604,7 +604,7 @@ class TestQueueCliGate(unittest.TestCase):
                 "maps":[],"coverage_complete":False}]}),encoding="utf8")
             out = io.StringIO()
             with contextlib.redirect_stdout(out):
-                code = progress.main(["--scope-file",str(scope),"--require-queue","--json"])
+                code = progress.main(["--scope-file",str(scope),"--legacy-audit","--require-queue","--json"])
             self.assertEqual(code,3)
             result = json.loads(out.getvalue())
             self.assertFalse(result["queue_registration_complete"])
