@@ -723,6 +723,32 @@ test('v4 independent ready work wakes root once while unrelated child stays busy
  }finally{await h.cleanup()}
 });
 
+
+test('v4.0.1: exact tool signature survives every normal context; missing report reminder never wakes a session',async()=>{
+ const h=await harness({reportFixture:true,statusText:status.replace('runnable','awaiting_children')});
+ try{
+  const root='ses_root';await h.markRunning();
+  const event={sessionID:root,agent:'Orchestrator',system:[]};await h.hooks.context(event);
+  assert.equal(event.system.length,1);assert.ok(event.system[0].text.includes(JSON.stringify({canonical_root:h.repo})));assert.match(event.system[0].text,/no action parameter/);
+  await h.hooks.context(event);assert.equal(event.system.length,1);
+  const child={sessionID:'child',agent:'Builder',system:[]};await h.hooks.context(child);assert.equal(child.system.length,0);
+  await h.hooks['experimental.idle']({sessionID:root,background:[]});
+  assert.equal(h.synthetic.length,0);assert.equal(h.admissions.length,0);
+  await h.guard.onEvent({type:'session.execution.started',data:{sessionID:root}});
+  const next={sessionID:root,agent:'Orchestrator',system:[]};await h.hooks.context(next);
+  assert.match(next.system[0].text,/Previous boundary lacked a confirmed publication/);
+  const a=(await h.reportTool.execute({canonical_root:h.repo},{sessionID:root})).content[0].text;
+  const prepared={sessionID:root,agent:'Orchestrator',system:[]};await h.hooks.context(prepared);assert.match(prepared.system[0].text,/already prepared for this execution/);
+  await h.guard.onEvent({type:'session.text.ended',data:{sessionID:root,assistantMessageID:'msg_good',ordinal:0,text:a}});
+  await h.hooks['experimental.idle']({sessionID:root,background:[]});
+  assert.equal(h.logs.filter(x=>x.e==='report-published').length,1);
+  await h.guard.onEvent({type:'session.execution.started',data:{sessionID:root}});
+  const clean={sessionID:root,agent:'Orchestrator',system:[]};await h.hooks.context(clean);
+  assert.doesNotMatch(clean.system[0].text,/Previous boundary lacked|already prepared for this execution/);
+  assert.equal(h.synthetic.length,0);assert.equal(h.admissions.length,0);
+ }finally{await h.cleanup()}
+});
+
 test('public guard requires explicit enablement, including missing or partial config',async()=>{
  const repo=await fs.mkdtemp(path.join(os.tmpdir(),'guard-public-opt-in-'));
  try{

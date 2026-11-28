@@ -1,5 +1,5 @@
 /**
- * OpenCode V2 continuation guard (v5.0). Opts in implicitly only through a real primary
+ * OpenCode V2 continuation guard (v5.0.1). Opts in implicitly only through a real primary
  * Orchestrator MODEL CONTEXT hook; NEVER parses user text or starts stale sessions.
  * Uses V2 session.execution.* lifecycle, not deprecated session.idle.
  */
@@ -71,7 +71,7 @@ export async function startGuard(ctx,{pluginDir,logger,now=()=>Date.now(),setInt
   const loadedAt=now();
   const logEvent=(event,detail={})=>log(event,{project:repoHash,...detail});
   // Reporting state is ephemeral output, never a second queue or liveness proof.
-  let reportRoot=null,reportCandidate=null,reportModel=null,reportBoundary=null,reportEpoch=0,lastPublishedMessage=null;
+  let reportRoot=null,reportCandidate=null,reportModel=null,reportBoundary=null,reportEpoch=0,lastPublishedMessage=null,reportMissedRoot=null;
   const telemetry=createTelemetry(now);
   const reportTexts=new Map();
   let reportVerifyInFlight=null;
@@ -79,8 +79,15 @@ export async function startGuard(ctx,{pluginDir,logger,now=()=>Date.now(),setInt
   function advanceReportBoundary(){reportEpoch++;reportBoundary=null;reportTexts.clear();}
   const reportObserved=()=>Object.entries(s.childSessions??{}).filter(([,r])=>!r.waitConfirmed||!!r.diagnosis||(r.at??0)>=s.lastStartedAt).map(([id,r])=>({id,state:liveState(r),role:r.role??null,startedAt:r.startedAt??r.at??null}));
   const reporter=createReporter(ctx,{repo,pluginDir,now,log:logEvent,getRoot:()=>reportCandidate,getModel:()=>reportModel,getBoundary:()=>reportEpoch,getObserved:reportObserved});
-  const reportInstruction='REPORT CONTRACT: first dispatch safe work and persist actual queue state. At each primary status/release/wait call workflow_report for the canonical root; publish its entire Russian result verbatim, all lines, prefixes, lists and receipt. Do not regenerate, condense or omit unchanged queue. Reporting is not a gate: if unavailable, show current facts and uncertainty, never stop or repeat engineering for formatting. Historical closure is not new production verification. No extra Reporter session or report-only commits.';
-  function injectReportInstruction(event){if(Array.isArray(event.system)&&reportRegistration)event.system.push({type:'text',text:reportInstruction});}
+  const reportInstruction=`REPORT CONTRACT: At EACH primary wait/status/release boundary, after dispatching safe work and updating the checkpoint, call workflow_report(${JSON.stringify({canonical_root:repo})}). It has no action parameter; workflow_intel is unrelated. Publish the entire returned Russian Markdown as the visible assistant reply, including metrics, all table rows, line breaks and receipt. A previous report (even identical revision) never satisfies a new wait. Do not write your own delta instead. If a report is already prepared in this execution and no engineering/state change followed, publish it now; do not call the tool repeatedly. If work changed, refresh once before waiting. A real missing tool/result permits a grounded manual fallback, not an engineering pause. No extra Reporter session or report-only commits.`;
+  function injectReportInstruction(event){
+    if(!Array.isArray(event.system)||!reportRegistration)return;
+    const pending=reportMissedRoot===event.sessionID?' Previous boundary lacked a confirmed publication; on this normal turn prepare and publish the current report before waiting, not the old report.':'';
+    const prepared=reporter.expected(event.sessionID,reportEpoch)?' A report is already prepared for this execution. Publish that complete result if no work has changed.':'';
+    const text=reportInstruction+pending+prepared;
+    const index=event.system.findIndex(p=>p?.type==='text'&&p.text?.startsWith('REPORT CONTRACT:'));
+    if(index>=0)event.system[index]={type:'text',text};else event.system.push({type:'text',text});
+  }
   async function verifyReportBoundary(id,{allowRepair=false}={}){
     if(!reportRegistration||reportRoot!==id||disposed||s.suspended||s.pendingOwnerPrompt)return;
     const epoch=reportEpoch;
@@ -105,8 +112,9 @@ export async function startGuard(ctx,{pluginDir,logger,now=()=>Date.now(),setInt
         }
         if(!valid())return;
         if(published&&reporter.markPublished(id,epoch)){
-          reportBoundary=epoch;lastPublishedMessage=published;await logEvent('report-published',{sessionId:id,boundary:epoch});return;
+          reportBoundary=epoch;lastPublishedMessage=published;reportMissedRoot=null;await logEvent('report-published',{sessionId:id,boundary:epoch});return;
         }
+        reportMissedRoot=id;
         await logEvent('report-missing-or-unverified',{sessionId:id,boundary:epoch,prepared:!!expected});
         if(allowRepair)reportBoundary=epoch;
         // Observability must not create an extra model turn.
@@ -152,7 +160,7 @@ export async function startGuard(ctx,{pluginDir,logger,now=()=>Date.now(),setInt
       const id=event.sessionID;if(typeof id!=='string'||!id)return;
       const info=await bounded(ctx.session.get({sessionID:id}),12000,'context-get');
       if(!sessionMatches(info,id,repo,cfg.agent))return;
-      if(reportRoot&&reportRoot!==id){reporter.reset();reportRoot=null;advanceReportBoundary();lastPublishedMessage=null;}
+      if(reportRoot&&reportRoot!==id){reporter.reset();reportRoot=null;reportMissedRoot=null;advanceReportBoundary();lastPublishedMessage=null;}
       const {decision,stamps,scope,workflow}=await eligibility();
       reportCandidate=scope?.schema==='openworkflow-progress-scope-v1'&&workflow?id:null;
       reportModel=event.model??info.model??null;
@@ -289,7 +297,7 @@ export async function startGuard(ctx,{pluginDir,logger,now=()=>Date.now(),setInt
       }
     }
     if(id===reportRoot&&type==='session.execution.succeeded')void verifyReportBoundary(id);
-    if(id===reportRoot&&['session.execution.interrupted','session.execution.failed','session.error','session.deleted'].includes(type)){reporter.reset();reportRoot=null;reportCandidate=null;advanceReportBoundary();telemetry.reset();}
+    if(id===reportRoot&&['session.execution.interrupted','session.execution.failed','session.error','session.deleted'].includes(type)){reporter.reset();reportRoot=null;reportCandidate=null;reportMissedRoot=null;advanceReportBoundary();telemetry.reset();}
     if(!s.armedSessionId)return;
     if(id!==s.armedSessionId){
       activity(id,type);
@@ -588,7 +596,7 @@ export async function startGuard(ctx,{pluginDir,logger,now=()=>Date.now(),setInt
     }
     if(cfg.reportEnabled&&typeof ctx.tool?.transform==='function'){
       try{reportRegistration=await ctx.tool.transform(editor=>editor.add({
-        name:'workflow_report',description:'Read-only one-shot Reporter. Use after engineering dispatch and checkpoint, before every primary status/wait/release. Returns complete current Russian text immediately without waiting for model translation; publish the entire result as the only visible status reply, preserving every line break and list bullet including receipt, at EVERY boundary, even for same revision. No separate Reporter session.',
+        name:'workflow_report',description:'Read-only one-shot Reporter. Use after engineering dispatch and checkpoint, before every primary status/wait/release. Returns complete current Russian text immediately without waiting for model translation; publish the entire result as the only visible status reply, preserving every line break, metric and Markdown table row including receipt, at EVERY boundary, even for same revision. No separate Reporter session.',
         input:{type:'object',properties:{canonical_root:{type:'string',description:'Verified absolute canonical planning root, not a release/worker checkout'}},required:['canonical_root'],additionalProperties:false},options:{codemode:true},
         execute:async(input,toolContext)=>{
           if(typeof input.canonical_root!=='string'||!path.isAbsolute(input.canonical_root)||normalizePath(path.resolve(input.canonical_root))!==normalizePath(repo))throw Error('Canonical planning root differs from this session location; use the explicit verified canonical plan for a degraded/manual report, do not certify this checkout.');
@@ -632,7 +640,7 @@ export async function startGuard(ctx,{pluginDir,logger,now=()=>Date.now(),setInt
       }
     })();
     timer=setIntervalFn(()=>{void check('timer')},cfg.pollMs);
-    await logEvent('plugin-loaded',{version:'5.0',sessionTracking:'model-context-and-execution-events'});
+    await logEvent('plugin-loaded',{version:'5.0.1',sessionTracking:'model-context-and-execution-events'});
     return async()=>{
       disposed=true;ready=false;
       if(timer!==null)clearIntervalFn(timer);

@@ -67,7 +67,7 @@ test('degraded snapshot from real screenshot-style checkpoint never dumps raw ev
  await fs.mkdir(path.join(repo,'plans'));await fs.writeFile(path.join(repo,'plans','progress_scope.json'),JSON.stringify({...scope,tasks:[{id:'clock',title:'Понимание времени',status:'REVIEW',queue_position:3},{id:'emb',status:'BUILDING',queue_position:47,source_note:'owner corrective; SIMPL-01..07 VERIFIED; MODEL-SWAP-01 pending; checkout_sha=abcdef123456'}]}));
  await fs.writeFile(path.join(repo,'plans','workflow_state.md'),`Production: 2.58.241 @ 3f42cfdd1 (branch release/embed-simplify-2.58.241); healthz verified_deployed (checkout_sha=abcdef123456), PG digests unchanged, NRestarts 0, DDL 0\nLast completed: code-only rollback 2.58.240\nActive feature: owner corrective — MODEL-SWAP-01..05 PENDING + QRNG IBM P5B\nNext execution: awaiting_children\nNext unlocks: M5B/3 REVIEW -> code-only 2.58.238\nHuman gate: none`);
  const r=createReporter({}, {repo,pluginDir:path.dirname(fileURLToPath(new URL('../report.mjs',import.meta.url))),getRoot:()=> 'root',progressFn:async()=>progress});
- const t=await r.generate('root',undefined,1);assert.match(t,/на сервере версия 2\.58\.241/);assert.doesNotMatch(t,/checkout_sha|verified_deployed|PG digests|NRestarts|MODEL-SWAP|M5B\/3|rollback|2\.58\.240/);assert.match(t,/\n- Этапы:/);assert.match(t,/\n\n\*\*Сейчас в работе\*\*/);assert.match(t,/Полная очередь \(2\)/);assert.match(t,/№3\. ID: \*\*clock\*\* — Понимание времени/);assert.match(t,/№47\. ID: \*\*emb\*\* — Название уточняется/);assert.match(t,/После получения результатов агентов/);r.reset();
+ const t=await r.generate('root',undefined,1);assert.match(t,/на сервере версия 2\.58\.241/);assert.doesNotMatch(t,/checkout_sha|verified_deployed|PG digests|NRestarts|MODEL-SWAP|M5B\/3|rollback|2\.58\.240/);assert.match(t,/\n- Этапы:/);assert.match(t,/\n\n\*\*Сейчас в работе\*\*/);assert.match(t,/Полная очередь \(2\)/);assert.match(t,/\| 3 \| ID: \*\*clock\*\* — Понимание времени \|/);assert.match(t,/\| 47 \| ID: \*\*emb\*\* — Название уточняется \|/);assert.match(t,/После получения результатов агентов/);r.reset();
  }finally{await fs.rm(repo,{recursive:true,force:true})}
 });
 test('one bad field cannot discard valid translation; repeat failures for unchanged fields stop after next real boundary',async()=>{
@@ -104,12 +104,12 @@ test('existing checkpoint functional sentence is usable even with no model; proo
  const t=renderReport(f,{degraded:true},Date.now(),'revision');
  assert.match(t,/Упростили проверку совместимости векторной памяти/);assert.match(t,/Бот теперь точнее понимает относительные даты/);assert.match(t,/Исправляют ошибку сохранения ключа/);assert.match(t,/Повторно проверят подключение IBM/);assert.match(t,/нужен действующий ключ/);assert.doesNotMatch(t,/health|DDL|SHA|3f42cfdd1|UR-C-CLOCK|evidence:/);
 });
-test('42 open tasks retain each separate bullet and queue positions; known titles retain lookup IDs',()=>{
+test('42 open tasks retain separate table rows, positions, priority and lookup IDs',()=>{
  const tasks=Array.from({length:42},(_,i)=>({id:'internal-task-'+i,title:'Задача разработки '+(i+1),queue_position:i+1+(i>=3?2:0),priority:i%2===0?0:'p3',status:i===0?'REVIEW':'PENDING'}));
  const f=reportFacts({scope:{schema:scope.schema,tasks},workflow:'Human gate: none'},progress);
  const t=renderReport(f,{degraded:true},Date.now(),'revision')+'\n\nПубликация: receipt';
- assert.match(t,/Полная очередь \(42\)/);assert.equal((t.match(/^- №\d+\./gm)||[]).length,42);assert.match(t,/- №6\. ID: \*\*internal-task-3\*\* — Задача разработки 4/);assert.match(t,/приоритет P0/);assert.equal((t.match(/ID: \*\*internal-task-/g)||[]).length,42);assert.match(t,/- Поручения:[^\n]+\n- Этапы:[^\n]+\n- Требования:/);
- assert.ok(!containsReport(t.replace(/\n- №/g,' - №'),t));assert.ok(!containsReport(t.replace(/\n\n/g,'\n'),t));assert.ok(!containsReport(t.replace(/^(- №6\.[^\n]*)\n/m,''),t));assert.ok(containsReport(t.replace(/\n/g,'\r\n'),t));
+ assert.match(t,/Полная очередь \(42\)/);assert.equal((t.match(/^\| \d+ \|/gm)||[]).length,42);assert.match(t,/\| 6 \| ID: \*\*internal-task-3\*\* — Задача разработки 4 \| P3 \| в очереди \|/);assert.match(t,/\| P0 \|/);assert.equal((t.match(/ID: \*\*internal-task-/g)||[]).length,42);assert.match(t,/- Поручения:[^\n]+\n- Этапы:[^\n]+\n- Требования:/);
+ assert.ok(!containsReport(t.replace(/\n(?=\| \d+ \|)/g,' '),t));assert.ok(!containsReport(t.replace(/\n\n/g,'\n'),t));assert.ok(!containsReport(t.replace(/^\| 6 \|[^\n]*\n/m,''),t));assert.ok(containsReport(t.replace(/\n/g,'\r\n'),t));
 });
 
 
@@ -123,10 +123,10 @@ test('queue uses exact original source codes, mapped aliases, and labeled fallba
   const source='# EXAMPLE PROJECT — SEARCH-QUALITY-01 — Достоверный фактчек\n# '+h+'\n```md\n# CODE-EXAMPLE-01\n```\n';
   await fs.writeFile(path.join(repo,'plans','current_task.md'),source);await fs.writeFile(path.join(repo,'plans','progress_scope.json'),JSON.stringify(taskScope));await fs.writeFile(path.join(repo,'plans','workflow_state.md'),'Human gate: none');
   const state=await readReportState(repo);const text=renderReport(reportFacts(state,progress),{titles:{'search-quality-01':'НЕВЕРНЫЙ-CODE-99'}});
-  assert.match(text,/- №9\. \*\*SEARCH-QUALITY-01\*\* — Достоверный фактчек/);
-  assert.match(text,/- №10\. \*\*MEMORY-DESIGN-01\*\* — Улучшение памяти/);
-  assert.match(text,/- №11\. ID: \*\*unknown-code-01\*\* — Другая задача/);
-  assert.match(text,/- №12\. ID: \*\*code-example-01\*\* — Пример задачи/);
+  assert.match(text,/\| 9 \| \*\*SEARCH-QUALITY-01\*\* — Достоверный фактчек/);
+  assert.match(text,/\| 10 \| \*\*MEMORY-DESIGN-01\*\* — Улучшение памяти/);
+  assert.match(text,/\| 11 \| ID: \*\*unknown-code-01\*\* — Другая задача/);
+  assert.match(text,/\| 12 \| ID: \*\*code-example-01\*\* — Пример задачи/);
   assert.doesNotMatch(text,/CODE-EXAMPLE-01|НЕВЕРНЫЙ/);
   await fs.writeFile(path.join(repo,'plans','current_task.md'),source.replace('SEARCH-QUALITY-01','SEARCH-QUALITY-02'));
   const revised=await readReportState(repo);assert.notEqual(revised.revision,state.revision);assert.equal(revised.sourcePrefixes.has('search-quality-01'),false);
@@ -157,4 +157,30 @@ test('finite delivery separates external proof, legacy closed reconciliation and
  assert.match(external,/Проверка внешнего оборудования/);assert.match(external,/Сверка ранее заявленной доставки/);assert.match(external,/Старый релиз/);assert.match(external,/Необязательное наблюдение после выпуска/);assert.match(external,/Оценка естественности/);
  const unknown=renderReport(reportFacts({scope:s,workflow:''},{...progress,measurable:false,stale_sources:['changed'],engineering_delivery:d}),{});
  assert.match(unknown,/Полная очередь \(4\)/);assert.doesNotMatch(unknown,/Доставлено, ожидаются обязательные внешние доказательства/);
+});
+
+
+test('recent recorded cleanup and feature metrics are visible near top without any model',()=>{
+ const recent=['Удалены 9 завершённых рабочих копий; занятое место уменьшилось с 18 до 10,7 ГБ.','Кеш: с 13,8 до 5,6 ГБ; удалён 31 каталог.','Удалён plans/plans.zip; workflow_state.md уменьшен с 462 до 10,5 КБ.','Проверки: 108/108 пройдено.','Сохранены активные рабочие копии и резервные копии.','Удалены 8 временных файлов. | evidence: raw SHA abcdef123456'];
+ const workflow='Production: 2.58.272 — Обновление установлено.\nRecent results:\n'+recent.map(v=>'- '+v).join('\n')+'\n- Удалены 8 временных файлов.\n- Перенесён `runtime_task.md` в архив.\n- health local+public 200, DDL 0, NRestarts 0.\n- Проверка password=secret-value.\n- Удалён C:\\Users\\ExampleUser\\temp\\x.md.\n- Удалён /home/user/private.md.\nHuman gate: none\n## История\nRecent results: Удалены 999 файлов.';
+ const facts=reportFacts({scope,workflow},progress);const text=renderReport(facts,{completed:'Общая фраза о завершении.',degraded:true});
+ for(const row of recent)assert.ok(text.includes(row.split(' | evidence:')[0]),row);
+ assert.equal((text.match(/Удалены 8 временных файлов\./g)||[]).length,1);assert.match(text,/Перенесён runtime_task\.md в архив/);
+ assert.ok(text.indexOf('Удалены 9 завершённых')<text.indexOf('**На сервере**'));
+ assert.doesNotMatch(text,/999 файлов|secret-value|health local|DDL 0|NRestarts|abcdef123456|C:\\Users|home\/user/);
+ assert.match(text,/Часть записей не удалось отобразить/);
+ assert.match(text,/Полная очередь \(3\)/);
+});
+test('only actual recorded notes are shown; history and model invented metrics do not become recent facts',()=>{
+ const facts=reportFacts({scope,workflow:'Last completed: Сохранены активные данные.\n## Старый отчёт\nRecent results: Удалены 999 файлов.'},progress);
+ const t=renderReport(facts,{recentResults:['Удалены 777 файлов.'],completed:'Сохранены активные данные.'});
+ assert.doesNotMatch(t,/999 файлов|777 файлов|Последние конкретные результаты/);
+ assert.match(t,/Сохранены активные данные/);
+});
+test('queue table preserves dependency prefix, missing priority, real waiting reason and every row',()=>{
+ const tasks=[{id:'one',title:'Проверка',status:'BLOCKED',queue_position:2,blocked_by:['two'],blocker_reason:'Нужен доступ к тестовой группе.'},{id:'two',title:'Настройки',status:'PENDING',queue_position:5,priority:'P0'},{id:'three',title:'Память',status:'PENDING'}];
+ const f=reportFacts({scope:{...scope,tasks},workflow:'Human gate: none',sourcePrefixes:new Map([['two','TEST-01']])},progress);const t=renderReport(f,{});
+ assert.match(t,/\| 2 \| ID: \*\*one\*\* — Проверка \| — \| есть препятствие — зависит от: TEST-01 — Нужен доступ к тестовой группе\. \|/);
+ assert.match(t,/\| 5 \| \*\*TEST-01\*\* — Настройки \| P0 \| в очереди \|/);
+ assert.match(t,/\| Без позиции \| ID: \*\*three\*\* — Память \|/);
 });

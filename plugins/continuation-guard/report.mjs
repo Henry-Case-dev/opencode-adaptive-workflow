@@ -20,11 +20,16 @@ const technical = /(?:`|https?:\/\/|[A-Za-z]:\\|\/(?:var|tmp|home)\/|\b[0-9a-f]{
 // Version strings, actual brand names and ordinary Russian terms are allowed;
 // bare technical identifiers, measurement dumps and Markdown markup are not.
 const internalCode= /\b(?:[A-Z]{2,}(?:-[A-Z]+)+-\d+[A-Z0-9.-]*|[A-Z]{2,}-0\d+|[A-Z]{1,3}\d+[A-Z]|[A-Z]{1,3}\d+-[A-Z]{1,3}\d+|[A-Z]{2,}(?:-[A-Z]{1,}){2,})\b/;
-const humanText=(v,max=300)=>{
+const humanText=(v,max=300,{metrics=false}={})=>{
   if(typeof v!=='string'||/[\r\n\t]/.test(v))return null;
-  const t=safe(v);
-  if(!t||t.length>max||!/[А-Яа-яЁё]/.test(t)||technical.test(t)||internalCode.test(t)||/[<>]|\*\*|^[-#]|\|/.test(t))return null;
-  const latin=(t.match(/[A-Za-z]/g)||[]).length,cyr=(t.match(/[А-Яа-яЁё]/g)||[]).length;
+  // Inline code is common in handoffs. Only unwrap ordinary relative filenames
+  // in explicit recent-result notes; other code/diagnostics still fail closed.
+  const t=metrics?safe(v).replace(/`((?:[\w.-]+\/)*[\w.-]+\.(?:md|jsonc?|zip|py|mjs|js|ts|txt|log|yaml|yml|toml|ini))`/gi,'$1'):safe(v);
+  const checked=metrics?t
+    .replace(/(?<![\w/\\:.-])(?:[\w.-]+\/)*[\w.-]+\.(?:md|jsonc?|zip|py|mjs|js|ts|txt|log|yaml|yml|toml|ini)(?![\w/\\.-])/gi,'файл')
+    .replace(/\b\d+\s*\/\s*\d+\b/g,'число'):t;
+  if(!t||t.length>max||!/[А-Яа-яЁё]/.test(t)||technical.test(checked)||internalCode.test(t)||metrics&&/(?:[A-Za-z]:[\\/]|(?:^|\s)\/(?:[^\s]+)|\b(?:Bearer|api[_ -]?key|password|secret|token)\s*[:=])/i.test(t)||/[<>]|\*\*|^[-#]|\|/.test(t))return null;
+  const latin=(checked.match(/[A-Za-z]/g)||[]).length,cyr=(checked.match(/[А-Яа-яЁё]/g)||[]).length;
   if(latin>cyr*0.45||/(?:\blegs\b|(?:реальн[а-яё]*|резервн[а-яё]*|рабоч[а-яё]*)\s+ног[а-яё]*)/iu.test(t))return null;
   return t;
 };
@@ -138,11 +143,20 @@ export function reportFacts(state,progress,previous=null){
   const fields={};
   let field=null;
   for(const line of header.split(/\r?\n/)){
-    const m=line.match(/^(Task|Primary phase|Active feature|Active lanes|Join barriers|Last verified|Last completed|Next unlocks|Next execution|Review|Deployment|Human gate|Status|Production|Planning root):\s*(.*)$/i);
+    const m=line.match(/^(Task|Primary phase|Active feature|Active lanes|Join barriers|Last verified|Last completed|Recent results|Next unlocks|Next execution|Review|Deployment|Human gate|Status|Production|Planning root):\s*(.*)$/i);
     if(m){field=m[1].toLowerCase();(fields[field]??=[]).push(safe(m[2]));}
-    else if(field&&/^\s*(?:[-*]|\d+[.)])\s+/.test(line))fields[field][fields[field].length-1]+='; '+safe(line);
+    else if(field&&/^\s*(?:[-*]|\d+[.)])\s+/.test(line)){
+      if(field==='recent results')fields[field].push(safe(line.replace(/^\s*(?:[-*]|\d+[.)])\s+/,'')));
+      else fields[field][fields[field].length-1]+='; '+safe(line);
+    }
     else if(line.trim())field=null;
   }
+  // The existing checkpoint is the only source of authored recent outcomes.
+  // Keep each measured observation intact; do not ask the model to calculate,
+  // reinterpret or certify it. These are recorded results, not a new server probe.
+  const recentRaw=(fields['recent results']??[]).filter(Boolean);
+  const recentResults=[...new Set(recentRaw.map(v=>humanText(v.split(/\s+\|\s+(?:evidence|доказательства):\s*/i,1)[0],300,{metrics:true})).filter(Boolean))];
+  const recentIncomplete=recentRaw.some(v=>!humanText(v.split(/\s+\|\s+(?:evidence|доказательства):\s*/i,1)[0],300,{metrics:true}));
   const previousIds=new Set(previous??[]);
   const completedSince=previous===null?null:done.filter(r=>!previousIds.has(r.id)).map(r=>({id:r.id,title:excerpt(r.title??r.name??r.label??r.summary??r.description??r.source_note)}));
   const observed=state.observed??[];
@@ -150,7 +164,7 @@ export function reportFacts(state,progress,previous=null){
   const validIds=new Set(validRows.map(r=>r.id));
   const conflictingIds=[...new Set(state.scope.tasks.filter(r=>r&&typeof r.id==='string'&&r.id.trim()&&!validIds.has(r.id)).map(r=>r.id))];
   const malformedCount=state.scope.tasks.filter(r=>!r||typeof r.id!=='string'||!r.id.trim()).length;
-  return {tasks,fields,observed,pending,lean,conflictingIds,malformedCount,legacyClosed:delivery?.historical_count??null,newRecorded:delivery?.recorded_count??null,mapPartial:!!progress?.unmapped_tasks?.length||!!progress?.map_diagnostics?.length,deliveryKnown:!!delivery,deliveryCounts:delivery?{external:deferred.size,reconcile:reconcile.size,optional:optional.size}:null,completedCount:done.length,completedIds:done.map(r=>r.id),completedSince,progress:{delivery:statLine(delivery,!!delivery),tasks:statLine(ok?progress?.tasks:partial?.tasks,ok||!!partial),slices:statLine(req?progress?.slices:partial?.slices,req||!!partial),requirements:statLine(req?progress?.requirements:partial?.requirements,req||!!partial),partial:!!partial,reason:safe([progress?.reason,progress?.requirements_reason].filter(Boolean).join('; '))},queueCertified:progress?.queue_registration_complete===true};
+  return {tasks,fields,observed,pending,recentResults,recentIncomplete,lean,conflictingIds,malformedCount,legacyClosed:delivery?.historical_count??null,newRecorded:delivery?.recorded_count??null,mapPartial:!!progress?.unmapped_tasks?.length||!!progress?.map_diagnostics?.length,deliveryKnown:!!delivery,deliveryCounts:delivery?{external:deferred.size,reconcile:reconcile.size,optional:optional.size}:null,completedCount:done.length,completedIds:done.map(r=>r.id),completedSince,progress:{delivery:statLine(delivery,!!delivery),tasks:statLine(ok?progress?.tasks:partial?.tasks,ok||!!partial),slices:statLine(req?progress?.slices:partial?.slices,req||!!partial),requirements:statLine(req?progress?.requirements:partial?.requirements,req||!!partial),partial:!!partial,reason:safe([progress?.reason,progress?.requirements_reason].filter(Boolean).join('; '))},queueCertified:progress?.queue_registration_complete===true};
 }
 const one=(facts,k)=>facts.fields[k]?.length===1?facts.fields[k][0]:undefined;
 // Only an explicit version at the start of a current production claim. Never
@@ -207,6 +221,12 @@ export function renderReport(facts,prose={},now=Date.now(),revision=''){
   else if(facts.deliveryKnown){lines.splice(2,0,`- Инженерно завершено (по сохранённым доказательствам): ${facts.progress.delivery}`);lines[3]=`- Поручения полностью подтверждены по реестру: ${facts.progress.tasks}`;}
   if(facts.progress.partial)lines.push('','Прогресс только по проверенному зарегистрированному объёму и учтённым картам; новые требования и/или порядок очереди ещё не подтверждены. Это не общий процент проекта.');
   if(facts.progress.reason)lines.push('',`Ограничение подсчёта: ${facts.progress.reason==='Состояние изменилось во время подсчёта; цифры не подтверждены.'?facts.progress.reason:'Есть неподтверждённые данные. См. очередь и новые поручения ниже.'}`);
+  if(facts.recentResults?.length||facts.recentIncomplete||facts.completedSince?.length){
+    lines.push('', '**Последние конкретные результаты (по контрольной точке)**','');
+    if(facts.completedSince?.length)lines.push(`- В реестре с прошлого подтверждённого отчёта появилось закрытых записей: ${facts.completedSince.length}.`);
+    for(const result of facts.recentResults??[])lines.push(`- ${result}`);
+    if(facts.recentIncomplete)lines.push('- Часть записей не удалось отобразить в кратком формате; детали сохранены в контрольной точке.');
+  }
   lines.push('', '**На сервере**','',versionText+' '+value('production'), '', '**Выполнено**','',value('completed'), '', '**Сейчас в работе**','',value('active'));
   if(fb.running)lines.push('',`Запущено агентов: ${fb.running}. Их завершение пока не подтверждено.`);
   const diagnoses=[['terminal-unreconciled','есть событие завершения хода или задания, но окончание работы и доставка результата ещё не согласованы'],['silence-unverified','долго не присылали наблюдаемых событий; зависание не доказано'],['permission-wait','ожидают разрешения'],['permission-unknown','состояние разрешений не подтверждено'],['observed','обнаружены, но состояние исполнения пока неизвестно']];
@@ -225,21 +245,25 @@ export function renderReport(facts,prose={},now=Date.now(),revision=''){
   lines.push('', '**Дальше**','',value('next'), '', '**Что мешает**','',value('blockers'), '', '**Ваше участие**','',one(facts,'human gate')?.trim().toLowerCase()==='none'?fb.human:value('human'),'',`**Полная очередь (${engineering.length+(facts.conflictingIds?.length??0)+(facts.malformedCount??0)}):**`,'');
   if(facts.unavailable){lines[lines.length-2]='**Полная очередь:** не подтверждена — канонический реестр недоступен.';}else if(!engineering.length)lines.push('Нет открытых инженерных поручений в доступном реестре.');
   const byId=new Map(facts.tasks.map(row=>[row.id,row]));
+  // GFM table rendered by code; model never decides order, columns or row count.
+  const cell=v=>String(v??'').replace(/\\/g,'\\\\').replace(/\|/g,'\\|').replace(/[\r\n]+/g,' ');
+  const tableHeader=['| № | Поручение | Приоритет | Состояние |','| ---: | --- | :---: | --- |'];
   const rowLine=(row,detail)=>{
     const name=queueLabel(row,titles);
-    const dep=row.blocked_by.length?` — зависит от: ${row.blocked_by.map(id=>{const other=byId.get(id);return other?taskLabel(other,titles):displayId(id)}).join(', ')}`:'';
-    const priorityValue=Number.isSafeInteger(row.priority)&&row.priority>=0&&row.priority<=9?'P'+row.priority:typeof row.priority==='string'&&/^P[0-9]$/i.test(row.priority)?row.priority.toUpperCase():null;
-    const priority=priorityValue?` — приоритет ${priorityValue}`:'';
+    const dep=row.blocked_by.length?` — зависит от: ${row.blocked_by.map(id=>{const other=byId.get(id);return other?.sourcePrefix?displayId(other.sourcePrefix):other?taskLabel(other,titles):displayId(id)}).join(', ')}`:'';
+    const priorityValue=Number.isSafeInteger(row.priority)&&row.priority>=0&&row.priority<=9?'P'+row.priority:typeof row.priority==='string'&&/^P[0-9]$/i.test(row.priority)?row.priority.toUpperCase():'—';
     const uncertain=row.deliveryReconcile?' — нужно разрешить конкретное расхождение в записи':'';
     const blocker=humanText(row.blocker,220);const waiting=/WAITING|BLOCKED/.test(statusOf(row));const why=waiting?(blocker?' — '+blocker:' — конкретная причина в реестре не указана'):'';
-    return `- ${Number.isSafeInteger(row.position)&&row.position>0?'№'+row.position+'.':'Без позиции:'} ${name} — ${detail??statusNames[String(row.status).toUpperCase()]??'статус не распознан'}${priority}${detail?'':uncertain+dep+why}`;
+    const position=Number.isSafeInteger(row.position)&&row.position>0?row.position:'Без позиции';
+    const status=(detail??statusNames[String(row.status).toUpperCase()]??'статус не распознан')+(detail?'':uncertain+dep+why);
+    return `| ${cell(position)} | ${cell(name)} | ${cell(priorityValue)} | ${cell(status)} |`;
   };
-  for(const row of engineering)lines.push(rowLine(row));
+  if(engineering.length)lines.push(...tableHeader,...engineering.map(r=>rowLine(r)));
   if(facts.conflictingIds?.length||facts.malformedCount){lines.push('','**Конфликтующие записи очереди (не считаются выполненными):**','',...facts.conflictingIds.map(id=>`- **${displayId(id)}** — повторный идентификатор; нужно уточнить эту задачу.`));if(facts.malformedCount)lines.push(`- Записей без идентификатора: ${facts.malformedCount}.`);}
 
-  if(external.length){lines.push('',`**Доставлено, ожидаются обязательные внешние доказательства (${external.length}):**`,'',...external.map(r=>rowLine(r,'инженерная работа завершена; проверка ещё не подтверждена')));}
-  if(reconciliation.length){lines.push('',`**Сверка ранее заявленной доставки (${reconciliation.length}):**`,'','Не считать новой разработкой без обнаруженного дефекта; прежние записи не доказывают текущую доставку.',...reconciliation.map(r=>rowLine(r,'нужно сверить сохранённые доказательства')));}
-  if(optional.length){lines.push('',`**Необязательное наблюдение после выпуска (${optional.length}):**`,'',...optional.map(r=>rowLine(r,'не задерживает завершение')));}
+  if(external.length){lines.push('',`**Доставлено, ожидаются обязательные внешние доказательства (${external.length}):**`,'',...tableHeader,...external.map(r=>rowLine(r,'инженерная работа завершена; проверка ещё не подтверждена')));}
+  if(reconciliation.length){lines.push('',`**Сверка ранее заявленной доставки (${reconciliation.length}):**`,'','Не считать новой разработкой без обнаруженного дефекта; прежние записи не доказывают текущую доставку.','',...tableHeader,...reconciliation.map(r=>rowLine(r,'нужно сверить сохранённые доказательства')));}
+  if(optional.length){lines.push('',`**Необязательное наблюдение после выпуска (${optional.length}):**`,'',...tableHeader,...optional.map(r=>rowLine(r,'не задерживает завершение')));}
   if(facts.pending?.length){lines.push('', '**Новые поручения, ещё не учтённые в планах:**','');for(const p of facts.pending)lines.push(`- ${displayId(p.id)} — ${p.targets.map(id=>byId.has(id)?taskLabel(byId.get(id),titles):displayId(id)).join(', ')||'цели уточняются'}`);}
   if(!facts.queueCertified||facts.conflictingIds?.length||facts.malformedCount)lines.push('',facts.lean?'В реестре есть неполные записи; это не блокирует независимые задачи.':'Порядок очереди не полностью подтверждён.');
   lines.push('');
